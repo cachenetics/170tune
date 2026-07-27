@@ -40,6 +40,7 @@ GATE_TEMP=${GATE_TEMP:-60}      # soak until HBM reaches this many C - gate HOT,
 GATE_SOAK_MAX=${GATE_SOAK_MAX:-180}  # give up soaking after this many seconds
 GATE_COMPUTE=${GATE_COMPUTE:-45} # seconds of bit-exact GEMM checking per gate
 SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-600}
+WORKLOAD_TIMEOUT=${WORKLOAD_TIMEOUT:-900}  # 'gate --workload <cmd>': a workload that hangs is a FAIL
 DEVID_170HX=20c2
 
 c_hi=$'\033[1m'; c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_bad=$'\033[31m'; c_off=$'\033[0m'
@@ -80,14 +81,63 @@ disarm() { rm -f "$STATE/armed.json"; }
 # a receipt from another card proves nothing about this one and is deliberately not portable.
 receipt_file() { printf '%s/gated/%s/off%s_clk%s.json' "$STATE" "$(serial)" "$1" "$2"; }
 write_receipt() {
-    local off=$1 clk=$2 n=$3 tmax=$4 f; f=$(receipt_file "$off" "$clk")
+    local off=$1 clk=$2 n=$3 tmax=$4 wl=${5:-} f; f=$(receipt_file "$off" "$clk")
     mkdir -p "$(dirname "$f")"
     cat > "$f" <<EOF
 {"serial": "$(serial)", "offset": $off, "ceiling": $clk, "sweeps": $n, "peak_hbm_c": ${tmax:-0},
  "compute_check": $([ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ] && echo true || echo false),
+ "workload": $([ -n "$wl" ] && printf '"%s"' "$(printf '%s' "$wl" | tr -d '"\\')" || echo null),
  "gated": "$(date -Is)"}
 EOF
     sync
+}
+
+# ---------------------------------------------------------------- quarantine
+# The negative half of the record, and the one the gate cannot produce on its own.
+# A point can pass four hot sweeps and 56,688 bit-exact GEMMs and still fault within seconds of
+# real work: measured on the reference card, balanced/perf/max all gated clean and all killed an
+# sglang server mid-inference, one of them at CUDA graph capture with "an illegal instruction was
+# encountered". The gate's instruction mix is narrower than an application's, so a PASS is
+# necessary and not sufficient. When something is caught in service, record it here: persist
+# refuses a quarantined point even when a passing receipt exists.
+quarantine_file() { printf '%s/quarantine/%s/off%s_clk%s.json' "$STATE" "$(serial)" "$1" "$2"; }
+
+cmd_quarantine() {
+    need_root quarantine "$@"
+    if [ "${1:-}" = "list" ]; then
+        local d="$STATE/quarantine/$(serial)"
+        [ -d "$d" ] || { say "no quarantined points on card $(serial)"; return 0; }
+        say "${c_hi}quarantined on card $(serial):${c_off}"
+        local f
+        for f in "$d"/*.json; do [ -f "$f" ] || continue; sed 's/^/    /' "$f"; done
+        return 0
+    fi
+    local off=${1:?usage: 170tune quarantine <off> <clk> --reason "..."} clk=${2:?ceiling}; shift 2
+    local reason=""
+    while [ $# -gt 0 ]; do
+        case "$1" in --reason) reason=${2:-}; shift 2 ;; *) reason="$1"; shift ;; esac
+    done
+    [ -n "$reason" ] || die "a quarantine needs a reason - what did it do, and to what?"
+    local f; f=$(quarantine_file "$off" "$clk"); mkdir -p "$(dirname "$f")"
+    cat > "$f" <<EOF
+{"serial": "$(serial)", "offset": $off, "ceiling": $clk,
+ "reason": "$(printf '%s' "$reason" | tr -d '"\\')",
+ "by": "${SUDO_USER:-$(id -un)}", "at": "$(date -Is)"}
+EOF
+    sync
+    say "${c_warn}quarantined +$off/$clk on card $(serial)${c_off}"
+    say "   persist will now refuse it even with a passing gate receipt (--force still overrides)"
+    local live; live=$(cur_offset)
+    [ "${live:-}" = "$off" ] && say "${c_bad}   NOTE: the card is running +$off RIGHT NOW - 170tune reset${c_off}"
+    return 0
+}
+
+cmd_unquarantine() {
+    need_root unquarantine "$@"
+    local off=${1:?offset} clk=${2:?ceiling} f; f=$(quarantine_file "$off" "$clk")
+    [ -f "$f" ] || die "+$off/$clk is not quarantined on this card"
+    rm -f "$f"
+    say "cleared the quarantine on +$off/$clk. Re-gate it before you trust it."
 }
 
 # ---------------------------------------------------------------- apply / read
@@ -226,6 +276,11 @@ cmd_try() {
 
 # gate: the only thing that can call a point safe.
 cmd_gate() {
+    local workload="" pos=()
+    while [ $# -gt 0 ]; do
+        case "$1" in --workload) workload=${2:?--workload needs a command}; shift 2 ;; *) pos+=("$1"); shift ;; esac
+    done
+    set -- ${pos[@]+"${pos[@]}"}
     local off=${1:?offset} clk=${2:?ceiling} n=${3:-4}
     is_170hx || die "refusing: GPU 0 is not a 170HX"
     [ -x "$BENCH" ] || die "integrity gate not found at $BENCH - run install.sh to build 170hx-sweep, or set BENCH=/path to your own"
@@ -268,14 +323,38 @@ cmd_gate() {
     else
         say "  ${c_warn}compute check skipped (compute_check not found) - memory-only gate${c_off}"
     fi
+    # The gate above proves memory and one dense GEMM mix. An application is a WIDER mix, and the
+    # difference is not academic: balanced/perf/max passed this gate on the reference card and then
+    # killed an inference server within seconds. --workload runs your real thing as the last rung.
+    if [ -n "$workload" ] && [ "$fails" -eq 0 ]; then
+        say "  workload: $workload"
+        soak_to_temp >/dev/null
+        arm "$off" "$clk"
+        local wout wrc
+        wout=$(timeout "$WORKLOAD_TIMEOUT" bash -c "$workload" 2>&1); wrc=$?
+        disarm
+        if [ $wrc -eq 0 ]; then
+            say "  workload: ${c_ok}survived${c_off}  $(printf '%s' "$wout" | tail -1)"
+        else
+            say "  workload: ${c_bad}FAILED (exit $wrc)${c_off}  $(printf '%s' "$wout" | tail -2 | tr '\n' ' ')"
+            say "  ${c_warn}this is the case the sweeps cannot see. Quarantine it:${c_off}"
+            say "    170tune quarantine $off $clk --reason \"killed: $workload\""
+            fails=$((fails+1))
+        fi
+    fi
     if [ "$fails" -eq 0 ]; then
         say "${c_ok}GATED: offset=+$off ceiling=$clk passed $n/$n sweeps + compute (peak HBM ${tmax}C)${c_off}"
         [ "${tmax:-0}" -lt "$GATE_TEMP" ] 2>/dev/null && say "${c_warn}  CAUTION: HBM never reached ${GATE_TEMP}C (peaked ${tmax}C). Optimistic - raise GATE_SOAK_MAX.${c_off}"
-        write_receipt "$off" "$clk" "$n" "$tmax"
+        [ -n "$workload" ] || say "${c_warn}  NOTE: sweeps + GEMM only. A point can pass this and still fault under a real workload"
+        [ -n "$workload" ] || say "  (measured: 3 profiles gated clean here and killed an inference server). Re-run with"
+        [ -n "$workload" ] || say "  --workload '<your command>' to prove it against the thing you actually run.${c_off}"
+        write_receipt "$off" "$clk" "$n" "$tmax" "$workload"
         [ "$n" -ge 4 ] || say "${c_warn}  note: $n sweeps is a probe, not a gate. 'persist' wants 4 - see 'explain'.${c_off}"
         return 0
     fi
-    say "${c_bad}REJECTED: $fails/$n sweeps failed. Do not ship this point.${c_off}"
+    # Count CHECKS, not sweeps: the compute check and the workload are in this tally too, and
+    # reporting a failed workload as "n/n sweeps failed" would name the wrong culprit.
+    say "${c_bad}REJECTED: $fails check(s) failed out of $n sweep(s) plus compute$([ -n "$workload" ] && printf ' and workload'). Do not ship this point.${c_off}"
     return 1
 }
 
@@ -492,6 +571,10 @@ cmd_persist() {
             fi
         fi
         [ -d "$STATE/gated/$(serial)" ] && { say "gate receipts for this card:"; ls -1 "$STATE/gated/$(serial)" | sed 's/^/            /'; }
+        if [ -d "$STATE/quarantine/$(serial)" ] && [ -n "$(ls -A "$STATE/quarantine/$(serial)" 2>/dev/null)" ]; then
+            say "${c_warn}quarantined on this card (persist refuses these):${c_off}"
+            ls -1 "$STATE/quarantine/$(serial)" | sed 's/^/            /'
+        fi
         return 0 ;;
       off)
         say "-- removing boot persistence"
@@ -513,6 +596,16 @@ cmd_persist() {
 
     # ---- evidence check. stock needs none; everything else needs a receipt from THIS card.
     if [ "$prof" != "stock" ]; then
+        # A quarantine outranks a passing receipt: it is the record of something the gate MISSED.
+        local qf; qf=$(quarantine_file "$off" "$clk")
+        if [ -f "$qf" ]; then
+            say "${c_bad}QUARANTINED on this card: +$off/$clk is recorded as known-bad${c_off}"
+            sed 's/^/            /' "$qf"
+            say "  a passing gate receipt does not clear this - the gate is what missed it."
+            say "  if you believe it is fixed:  170tune unquarantine $off $clk"
+            [ "$force" = 1 ] || return 1
+            say "${c_warn}  --force: persisting a quarantined point anyway${c_off}"
+        fi
         local rf; rf=$(receipt_file "$off" "$clk")
         local sweeps=0 peak=0
         [ -f "$rf" ] && sweeps=$(grep -oE '"sweeps": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
@@ -540,6 +633,13 @@ cmd_persist() {
         else
             say "${c_ok}gate receipt found: +$off/$clk passed $sweeps sweeps at ${peak}C HBM on this card${c_off}"
             sed 's/^/            /' "$rf"
+            # Say plainly what the receipt does NOT cover. Not a refusal: an unforced receipt is
+            # still the best evidence there is, and refusing here would leave persist unusable.
+            if ! grep -q '"workload": "' "$rf"; then
+                say "${c_warn}  this receipt is sweeps + GEMM only - no real workload was run against it."
+                say "  three profiles with receipts like this killed an inference server on this card."
+                say "  before you rely on it in production:  170tune gate $off $clk 4 --workload '<your command>'${c_off}"
+            fi
         fi
     fi
 
@@ -620,9 +720,18 @@ COMMANDS
   status                      what the card is set to now, plus any armed marker or crash record.
   try     <off> <clk> [secs]  apply one point and measure it. Prints UNVERIFIED: completing a
                               benchmark is exactly what silent corruption looks like.
-  gate    <off> <clk> [n]     the proof. Soaks the card to GATE_TEMP, then runs n full-VRAM
-                              pattern sweeps plus a bit-exact compute check. Only this can call
-                              a point safe. Exit 0 = gated, 1 = rejected.
+  gate    <off> <clk> [n] [--workload <cmd>]
+                              the proof. Soaks the card to GATE_TEMP, then runs n full-VRAM
+                              pattern sweeps plus a bit-exact compute check. Exit 0 = gated,
+                              1 = rejected. NECESSARY BUT NOT SUFFICIENT: sweeps and a dense
+                              GEMM are a narrower instruction mix than a real application, and
+                              three profiles that passed this gate on the reference card killed
+                              an inference server within seconds. --workload runs YOUR command
+                              as the last rung and records that it survived.
+  quarantine <off> <clk> --reason "..."
+                              record a point as known-bad on this card - the thing the gate
+                              missed. persist then refuses it even with a passing receipt.
+  quarantine list             what is quarantined here.  unquarantine <off> <clk> clears one.
   ladder  <clk> [start] [step] [max]
                               walk the offset up at one ceiling, gating each rung, and stop at
                               the first rung that runs but fails the gate. Prints the highest
@@ -699,6 +808,8 @@ case "${1:-}" in
     apply)      shift; need_root apply "$@"; cmd_apply "$@" ;;
     persist)    shift; cmd_persist "$@" ;;
     reset)      need_root reset; exec "$OCAPPLY" stock ;;
+    quarantine)   shift; cmd_quarantine "$@" ;;
+    unquarantine) shift; cmd_unquarantine "$@" ;;
     selftest)   shift; need_root selftest "$@"; cmd_selftest "$@" ;;
     recover)    shift; cmd_recover "$@" ;;
     boot-check) shift; cmd_boot_check "$@" ;;
