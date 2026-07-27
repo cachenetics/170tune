@@ -143,6 +143,29 @@ tok/s output, mean TTFT 795 ms, mean TPOT 72 ms, 157.1 W, 1332 MHz mean, peak HB
 all 128 requests served and the server still up afterwards. That is about three minutes
 of load. It is evidence, not a soak.
 
+Since then the reference card has been gated and persisted at **+300/1400** with vLLM as
+the serving engine (4 hot sweeps, 56,680 GEMMs, then 96/96 requests served at concurrency
+24). It beats `eff` on both halves of the job, and costs power to do it:
+
+```
+point            decode      prefill      TTFT     draw
+eff +300/1350    292.9 tok/s 2670 tok/s   492 ms   157 W
++300/1400        298.9 tok/s 2744 tok/s   481 ms   170 W
+```
+
+A 31-minute burn-in there at concurrency 24 served 3552 requests with zero failures, zero
+throttle samples, throughput flat within 0.6%, HBM plateauing at 68 C. Note that this is
+a per-card result under one engine, and one step below the quarantined +300/1470.
+
+Two further results worth carrying:
+
+* **+300/1470 crashes vLLM exactly as it crashed sglang.** That quarantine is
+  engine-independent: the point is bad, not merely mismatched to one server.
+* **Capping power does not make this card cooler or quieter.** The fan curve is a
+  thermostat, so a cap just makes the fan lazier at the same temperature: fan 2665 ->
+  2494 rpm with HBM steady at 62-64 C. What the cap buys is room heat, 172 W against
+  113 W per card. "Cap it to run cooler" is the intuitive move and it is wrong here.
+
 Two honest conclusions:
 
 * Under real serving, tuning is worth about +5% (`match`), and the GFLOPS/W ordering
@@ -229,6 +252,17 @@ tools close that hole:
   `persist` then refuses it even if it holds a passing gate receipt. `quarantine list`
   shows the book, `unquarantine` lifts an entry.
 
+**The rung has to be the engine that will serve.** A workload rung running a different
+engine certifies the point against a load it will never see, and it cuts the other way
+too: a fault peculiar to the untested engine rejects a point the production one handles
+fine. On the reference card +300/1400 was nearly gated with an sglang rung after
+production had already moved to vLLM, and sglang had never been run at that point at all.
+A receipt naming a workload that is not the production engine is closer to no workload
+than to a real one, and `persist` prints the workload from the receipt so you can check.
+`tools/vllm_workload_check.sh` is a worked example: start the real unit, push real traffic
+through the real port, assert every request completed AND the server is still healthy
+afterwards, stop it again. Copy its shape, point it at your own service.
+
 Match the workload's DURATION to what you are claiming, too. The three profiles above
 failed within thirty seconds, so a short run does discriminate, but a point that survived
 three minutes of serving has been shown to survive three minutes of serving and nothing
@@ -251,6 +285,21 @@ always enough.
 is wedged it stops the persistence daemon and reloads the driver modules, and if that
 still does not bring the card back it says so honestly: the next step is a real power
 cycle, because a warm reboot leaves the card powered.
+
+**Querying the card is not the same as using it.** There is a wedge that every
+query-based check misses, seen after hard kills of an inference server mid-CUDA-context:
+`nvidia-smi` answers normally, NVML does not report `requires reset`, the clocks read
+fine, and no process can create a CUDA context. The signature from the application side
+is torch reporting `device_count()=1` with `is_available()=False`. An earlier `recover`
+cleared the offsets, saw a healthy card and printed "recovered" over exactly that state;
+the GPU stayed useless to every process on the box until the driver was reloaded by hand.
+
+So `recover` and `status` now run `ctx_probe`, which creates a context, allocates,
+launches a one-thread kernel and reads the result back. If that fails while `nvidia-smi`
+is healthy, `recover` goes straight to the driver reload instead of declaring success,
+and it will not call the card recovered until a context can actually be created.
+`ctx_probe` distinguishes out-of-memory (exit 3) from a refused context (exit 2), so a
+running server holding the VRAM is never mistaken for a wedge and never triggers a reload.
 
 Every risky apply is bracketed by an armed marker: `armed.json` (offset, ceiling, serial,
 timestamp, boot id) is written and synced BEFORE the point is applied and cleared only
@@ -329,6 +378,8 @@ GATE_SOAK_MAX=180     give up soaking after this many seconds
 GATE_COMPUTE=45       seconds of bit-exact GEMM checking per gate (0 disables)
 MEASURE_TIMEOUT=180   a measurement exceeding this is treated as a HANG
 WORKLOAD_TIMEOUT=900  'gate --workload': a workload that hangs counts as a FAILURE
+CTX_TIMEOUT=60        context probe timeout; a probe that hangs is treated as a wedge
+CTXPROBE=/path        the context probe (default: the ctx_probe installed here)
 BENCH=/path           the integrity sweep (default: the 170hx-sweep installed here)
 SWEEP_FRAC=0.95       fraction of FREE VRAM 170hx-sweep writes and verifies
 COMPUTE=/path         the compute checker        NVML=/path   nvml_oc
@@ -348,6 +399,9 @@ tools/170hx-sweep       the integrity gate: runs gpu_selftest, prints the one re
                         line 170tune gates on
 tools/gpu_selftest.cu   full-VRAM sweep: unique-per-address 64-bit pattern verified
                         exactly; catches silent MEMORY corruption and aliased backing
+tools/ctx_probe.cu      the smallest proof the card is USABLE: create a context, allocate,
+                        launch, read back. Catches the wedge nvidia-smi cannot see
+tools/vllm_workload_check.sh  worked 'gate --workload' rung against a real vLLM service
 tools/oc_eff.cu         sustained bf16 GEMM with in-process NVML power sampling
 tools/mem_probe.cu      streaming bandwidth + dependent-load latency probes
 docs/tuning-guide.md         the long-form findings

@@ -14,11 +14,15 @@ say "building probes for $ARCH"
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/mem_probe     tools/mem_probe.cu
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/gemm_probe    tools/gemm_probe.cu    -lcublas
 "$CUDA/bin/nvcc" -O2 -arch=$ARCH -o tools/gpu_selftest  tools/gpu_selftest.cu
+"$CUDA/bin/nvcc" -O2 -arch=$ARCH -o tools/ctx_probe     tools/ctx_probe.cu
 cc -O2 -o tools/nvml_oc tools/nvml_oc.c -I"$CUDA/include" -lnvidia-ml
 
 say "installing to /usr/local/bin"
 sudo install -m 755 tools/170tune tools/170hx-oc tools/170hx-sweep /usr/local/bin/
-sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_probe tools/gpu_selftest tools/nvml_oc /usr/local/bin/
+sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_probe tools/gpu_selftest tools/ctx_probe tools/nvml_oc /usr/local/bin/
+# A worked --workload rung. Installed as an example to copy, not as something 170tune calls: the
+# rung has to be YOUR engine, and this one knows about a particular vLLM unit and model path.
+sudo install -m 755 tools/vllm_workload_check.sh /usr/local/bin/
 sudo mkdir -p /var/lib/170tune
 
 if [ -d /etc/systemd/system ]; then
