@@ -1,0 +1,16 @@
+[Unit]
+Description=CMP 170HX clock-offset + power-limit profile (efficiency point)
+Documentation=https://example.invalid/root/cmp170hx/-/blob/main/analysis/oc_efficiency_2026-07-27.md
+After=nvidia-persistenced.service gen2-hammer.service
+Wants=nvidia-persistenced.service
+ConditionPathExists=/usr/local/bin/nvml_oc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Offsets are volatile: they are lost on every driver reload / reboot, so re-apply at boot.
+ExecStart=/usr/local/bin/170hx-oc eff
+ExecStop=/usr/local/bin/170hx-oc stock
+
+[Install]
+WantedBy=multi-user.target
