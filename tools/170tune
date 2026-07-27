@@ -29,7 +29,10 @@ user_home() { getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6;
 find_tool() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
 NVML=${NVML:-/usr/local/bin/nvml_oc}
 OCEFF=${OCEFF:-$(find_tool /usr/local/bin/oc_eff "$(user_home)/170hx/tools/oc_eff" "$HOME/170hx/tools/oc_eff")}
-BENCH=${BENCH:-$(find_tool /usr/local/bin/170hx-test.sh "$(user_home)/170hx/tools/170hx-test.sh" "$HOME/170hx/tools/170hx-test.sh")}
+# The integrity gate. 170hx-sweep (shipped here) is the sweep on its own; a fuller bench harness
+# that prints the same result line can be substituted with BENCH=.
+BENCH=${BENCH:-$(find_tool /usr/local/bin/170hx-sweep "$(dirname "$(readlink -f "$0")")/170hx-sweep" \
+                           /usr/local/bin/170hx-test.sh "$(user_home)/170hx/tools/170hx-test.sh" "$HOME/170hx/tools/170hx-test.sh")}
 COMPUTE=${COMPUTE:-$(find_tool /usr/local/bin/compute_check "$(user_home)/170hx/tools/compute_check" "$HOME/170hx/tools/compute_check")}
 OCAPPLY=${OCAPPLY:-/usr/local/bin/170hx-oc}
 MEASURE_TIMEOUT=${MEASURE_TIMEOUT:-180}
@@ -223,7 +226,7 @@ cmd_try() {
 cmd_gate() {
     local off=${1:?offset} clk=${2:?ceiling} n=${3:-4}
     is_170hx || die "refusing: GPU 0 is not a 170HX"
-    [ -x "$BENCH" ] || die "integrity gate not found at $BENCH (set BENCH=...)"
+    [ -x "$BENCH" ] || die "integrity gate not found at $BENCH - run install.sh to build 170hx-sweep, or set BENCH=/path to your own"
     apply_point "$off" "$clk" || die "could not apply offset=$off ceiling=$clk"
     say "gating offset=+$off ceiling=$clk: $n pattern sweeps + ${GATE_COMPUTE}s compute check, each soaked to ${GATE_TEMP}C HBM"
     local fails=0 i res errs tmax=0 t
