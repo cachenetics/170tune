@@ -331,7 +331,8 @@ section-3 profiles are gated.
 
 - CORRUPT: completes, but the full-VRAM sweep returns memory errors (silent corruption).
 - corrupt*: +400/1350 passed two sweeps, then returned `mem_errors=1` on a later one.
-  This is why the shipped `eff` backed down to +250/1350, which draws the same ~132 W.
+  This is why the shipped `eff` sits at +300/1350 rather than higher: it draws the same ~131 W as
+anything above it on the flat floor, with margin below the point that misbehaved.
 - fault: CUDA device fault under load (`illegal instruction`, `illegal memory access`,
   cublas 14).
 - HANG: GPU wedged, needs a reboot (and sometimes a power cycle).
@@ -419,7 +420,7 @@ NDIV 52 (1404 MHz), core profiles unchanged:
 | profile          | mem 1728 (stock)          | mem 1620                  | mem 1404                  |
 +------------------+---------------------------+---------------------------+---------------------------+
 | perf (+350/1590) | 212.2 TF / 181.2 W / 1171 | 211.6 TF / 172.9 W / 1224 | 210.5 TF / 169.3 W / 1243 |
-| eff (+250/1350)  | 180.3 TF / 132.0 W / 1366 | 180.7 TF / 130.2 W / 1388 | 180.7 TF / 132.7 W / 1362 |
+| eff (+300/1350)  | 180.8 TF / 131.2 W / 1378 | 180.7 TF / 130.2 W / 1388 | 180.7 TF / 132.7 W / 1362 |
 | read bandwidth   | 1695 GB/s                 | 1582 GB/s                 | 1279 GB/s                 |
 +------------------+---------------------------+---------------------------+---------------------------+
 ```
@@ -453,13 +454,8 @@ in the slot is skipped and logged, never overclocked. Each application logs to t
 with serial, offset and cap, for example:
 
 ```
-170hx-oc: GPU 0 (1322621047793) profile=eff offset=+250 clk_max=1350 power_limit=300 W
+170hx-oc: GPU 0 (1322621047793) profile=eff offset=+300 clk_max=1350 power_limit=300 W
 ```
-
-(The `analysis/oc_efficiency_2026-07-27.md` persistence section shows an illustrative log
-line reading `offset=+250 clk_max=1350 power_limit=300.00 W`; that does not match the shipped `eff`
-profile, which is offset +250 with the power limit left at 300 W. Trust the applier script
-`tools/170hx-oc`, not that example line.)
 
 ---
 

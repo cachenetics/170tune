@@ -113,14 +113,11 @@ perf       +350    1590        212.2      181.2 W    1171     throughput first,
 max        +350    1650        215.3      186.1 W    1157     peak validated
                                                               throughput
 ```
-
-Known documentation discrepancy, flagged deliberately: the applier (`170hx-oc`), its
-header table, and the `170tune` help all ship `eff` at +300/1350, and that point was
-re-gated hot (3/3 sweeps clean at 51-52 C). Several passages of the long-form tuning
-guide instead describe `eff` as +250/1350. Both points sit on the flat voltage floor
-(131-132 W, ~180 TF), so the practical difference is margin, not power: +250 leaves
-about 25 MHz more distance to the boundary. Trust the applier script for what
-actually ships; treat the guide's +250 references as the more conservative choice.
+One number to be careful with: `eff` ships at +300/1350, and that point was re-gated
+hot (3/3 clean sweeps at 51-52 C HBM). Earlier drafts of the measurement notes named
++250/1350 instead. Both sit on the flat part of the voltage floor and draw within a
+watt of each other, so the difference is margin rather than performance; the applier
+and this README are authoritative.
 
 Memory notes: the MEM VF offset is refused by the driver and memory overclock is
 closed by measurement (the PLL follows down but not up). Streaming bandwidth is
