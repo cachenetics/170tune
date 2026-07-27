@@ -47,7 +47,8 @@ table is unverified.
 
 * **CORRUPT** - completes, but the full-VRAM sweep returns memory errors (silent data corruption).
 * **corrupt\*** - `+400/1350` passed two sweeps, then returned `mem_errors=1` on a later one. This is
-  why the shipped `eff` backed down to `+250/1350`, which draws the same ~132 W.
+  why the shipped `eff` sits at `+300/1350` rather than higher: it draws the same ~131 W as
+  anything above it on the flat floor, with margin below the point that misbehaved.
 * **fault** - CUDA device fault under load (`illegal instruction`, `illegal memory access`, cublas 14).
 * **HANG** - GPU wedged, needs a reboot (and sometimes a power cycle).
 * `+400` at 1400 / 1470 / 1530 is **not tested on purpose**: `1380/+400` faults and `1590/+400` hangs,
