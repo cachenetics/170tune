@@ -13,11 +13,12 @@ say "building probes for $ARCH"
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/compute_check tools/compute_check.cu -lcublas
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/mem_probe     tools/mem_probe.cu
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/gemm_probe    tools/gemm_probe.cu    -lcublas
+"$CUDA/bin/nvcc" -O2 -arch=$ARCH -o tools/gpu_selftest  tools/gpu_selftest.cu
 cc -O2 -o tools/nvml_oc tools/nvml_oc.c -I"$CUDA/include" -lnvidia-ml
 
 say "installing to /usr/local/bin"
-sudo install -m 755 tools/170tune tools/170hx-oc /usr/local/bin/
-sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_probe tools/nvml_oc /usr/local/bin/
+sudo install -m 755 tools/170tune tools/170hx-oc tools/170hx-sweep /usr/local/bin/
+sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_probe tools/gpu_selftest tools/nvml_oc /usr/local/bin/
 sudo mkdir -p /var/lib/170tune
 
 if [ -d /etc/systemd/system ]; then
@@ -39,6 +40,6 @@ say "  sudo 170tune selftest    prove the detectors work on this box"
 say "  sudo 170tune gate 300 1350 4   prove a point on THIS card"
 say "  sudo 170tune persist eff       adopt it, now and at every boot"
 say ""
-say "NOTE: 170tune needs a full-VRAM integrity sweep to gate against. It looks for"
-say "170hx-test.sh; point it at your own with BENCH=/path/to/sweep. Without one, gate"
-say "degrades to a compute-only check and cannot catch silent MEMORY corruption."
+say "The gate runs 170hx-sweep (installed above): a full-VRAM unique-pattern write/verify plus"
+say "an exact compute checksum. Substitute a fuller bench harness with BENCH=/path if you have"
+say "one - it just has to print 'mem_errors=<n>  compute_ok=<0|1>' on one line."

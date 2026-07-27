@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# 170hx-sweep - the integrity gate 170tune gates against, in one command.
+#
+# Runs gpu_selftest (fills nearly all free VRAM with a globally-unique 64-bit pattern, reads it
+# back, verifies exactly; then an integer compute kernel checked against a CPU recompute) and
+# prints the one result line 170tune parses:
+#
+#     swept <MiB> MiB  mem_errors=<n>  compute_ok=<0|1>  bw(h2d)=<GB/s>  hbm_triad=<GB/s> GB/s
+#
+# Exit 0 iff the sweep completed with zero memory errors and a matching compute checksum.
+#
+# WHY A PATTERN SWEEP AND NOT A BENCHMARK: the failure mode that matters on an undervolted 170HX
+# is not a crash. The card completes the work, raises no Xid, and hands back wrong bytes. Only
+# writing known values across the whole framebuffer and reading them back catches that, which is
+# why this - not throughput - is what 'gate' runs, and why it runs it hot and more than once.
+#
+# The unique-per-address pattern also catches ALIASED memory: a card whose 64 GB unlock is fake
+# re-maps the same <8 GB underneath and the sweep reads back a value written to another address.
+#
+# Usage: 170hx-sweep [--no-unlock] [frac]
+#   --no-unlock  accepted and ignored - this tool never touches the unlock module, it only tests
+#                whatever VRAM is currently exposed. The flag exists so 170tune's gate can call
+#                either this or a fuller bench harness with the same arguments.
+#   frac         fraction of FREE VRAM to sweep (default 0.95, or $SWEEP_FRAC)
+#
+# Env: GPU=<index|uuid>  which card to test (default 0). SELFTEST=/path to the binary.
+set -uo pipefail
+
+FRAC="${SWEEP_FRAC:-0.95}"
+for a in "$@"; do
+  case "$a" in
+    --no-unlock) : ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) FRAC="$a" ;;
+  esac
+done
+
+find_bin() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return; }; done; printf '%s' "$1"; }
+SELFTEST=${SELFTEST:-$(find_bin /usr/local/bin/gpu_selftest "$(dirname "$(readlink -f "$0")")/gpu_selftest")}
+[ -x "$SELFTEST" ] || { echo "170hx-sweep: gpu_selftest not found (build it: see install.sh)" >&2; exit 2; }
+
+export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+out=$("$SELFTEST" "$FRAC" 2>&1); rc=$?
+
+get() { printf '%s\n' "$out" | grep -oE "^$1=.*" | head -1 | cut -d= -f2-; }
+swept=$(get MEM_SWEPT_MIB); merr=$(get MEM_ERRORS); cok=$(get COMPUTE_OK)
+h2d=$(get BW_H2D_GBs); triad=$(get BW_TRIAD_GBs)
+
+# A run that died mid-sweep must NOT look like a clean one. Report what is missing and fail:
+# 170tune treats a missing result line as a failed sweep, and that is the correct reading.
+if [ -z "$merr" ] || [ -z "$cok" ] || [ -z "$swept" ]; then
+  printf '%s\n' "$out" | tail -3 >&2
+  echo "170hx-sweep: the sweep did not complete (exit $rc) - treating as FAIL" >&2
+  exit 1
+fi
+
+printf '    swept %s MiB  mem_errors=%s  compute_ok=%s  bw(h2d)=%s  hbm_triad=%s GB/s\n' \
+  "$swept" "$merr" "$cok" "${h2d:-?}" "${triad:-?}"
+exit $rc

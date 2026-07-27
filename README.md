@@ -26,14 +26,17 @@ max   : 215.3 TFLOPS at 186.1 W (1157 GFLOPS/W)   +17% perf at under stock power
 ## Quick start
 
 ```
-# build the probes (CUDA toolkit, sm_80)
+# build the probes and install everything (CUDA toolkit, sm_80). Overclocks nothing.
+./install.sh
+
+# or by hand:
+nvcc -O2 -arch=sm_80 tools/gpu_selftest.cu  -o gpu_selftest
 nvcc -O2 -arch=sm_80 tools/compute_check.cu -o compute_check -lcublas
 nvcc -O2 -arch=sm_80 tools/oc_eff.cu        -o oc_eff        -lcublas -lnvidia-ml
 nvcc -O2 -arch=sm_80 tools/mem_probe.cu     -o mem_probe
 cc   -O2 tools/nvml_oc.c -o nvml_oc -lnvidia-ml
-
-# install the scripts and binaries where 170tune expects them
-sudo install tools/170tune tools/170hx-oc nvml_oc /usr/local/bin/
+sudo install tools/170tune tools/170hx-oc tools/170hx-sweep \
+             gpu_selftest compute_check oc_eff mem_probe nvml_oc /usr/local/bin/
 
 # then, in this order
 170tune explain          # the levers, the two regimes, the failure modes
@@ -259,8 +262,10 @@ evidence the harness is broken.
   environment: driver 610.43.03, VBIOS 92.00.6D.00.0A.
 - NVML (libnvidia-ml) for `nvml_oc` and in-process power sampling, and a CUDA
   toolkit to build the sm_80 probes.
-- A full-VRAM integrity sweep binary (`BENCH=` env; default is the local
-  `170hx-test.sh --no-unlock`). The gate does not exist without it.
+- Nothing external: the integrity sweep the gate runs (`170hx-sweep` +
+  `gpu_selftest`) ships here and `install.sh` builds it. Point `BENCH=` at a fuller
+  bench harness if you have one; it only has to print `mem_errors=<n>
+  compute_ok=<0|1>` on a single line.
 - root, bash, `nvidia-smi`.
 
 Per-card silicon varies. Every number above is from serial 1322621047793; do not
@@ -275,7 +280,8 @@ GATE_TEMP=60          HBM temperature to soak to before every sweep
 GATE_SOAK_MAX=180     give up soaking after this many seconds
 GATE_COMPUTE=45       seconds of bit-exact GEMM checking per gate (0 disables)
 MEASURE_TIMEOUT=180   a measurement exceeding this is treated as a HANG
-BENCH=/path           the full-VRAM integrity sweep
+BENCH=/path           the integrity sweep (default: the 170hx-sweep installed here)
+SWEEP_FRAC=0.95       fraction of FREE VRAM 170hx-sweep writes and verifies
 COMPUTE=/path         the compute checker        NVML=/path   nvml_oc
 ```
 
@@ -291,6 +297,11 @@ tools/nvml_oc.c         query/apply GPC and MEM VF offsets via NVML
 tools/compute_check.cu  bit-exact GEMM checker: same deterministic bf16 GEMM
                         repeated and compared bit for bit, catches silent COMPUTE
                         corruption the memory sweep cannot see
+tools/170hx-sweep       the integrity gate: runs gpu_selftest and prints the one
+                        result line 170tune gates on
+tools/gpu_selftest.cu   full-VRAM sweep - fills nearly all free VRAM with a
+                        unique-per-address 64-bit pattern and verifies it exactly,
+                        which catches silent MEMORY corruption and aliased backing
 tools/oc_eff.cu         sustained bf16 GEMM with in-process NVML power sampling
 tools/mem_probe.cu      streaming bandwidth + dependent-load latency probes
 docs/tuning-guide.md         the long-form findings
