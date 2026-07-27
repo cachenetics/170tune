@@ -122,7 +122,9 @@ soak_to_temp() {
     printf '%s' "${t:-0}"
 }
 
-cur_offset() { "$NVML" 2>/dev/null | awk '/current offset/{print $NF=="MHz"?$(NF-1):$NF; exit}'; }
+# nvml_oc prints the offset signed ("+350 MHz"). Strip the sign so this can be COMPARED with a
+# profile's offset, not just displayed - 'persist' checks the card actually took the setting.
+cur_offset() { "$NVML" 2>/dev/null | awk '/current offset/{v=($NF=="MHz")?$(NF-1):$NF; sub(/^\+/,"",v); print v; exit}'; }
 
 # ---------------------------------------------------------------- subcommands
 cmd_explain() {
@@ -465,16 +467,24 @@ cmd_persist() {
         local en act
         en=$(systemctl is-enabled "$PERSIST_UNIT" 2>&1); act=$(systemctl is-active "$PERSIST_UNIT" 2>&1)
         printf 'unit        : %s (%s / %s)\n' "$PERSIST_UNIT" "$en" "$act"
-        printf 'live offset : %s MHz\n' "$(cur_offset)"
-        printf 'live ceiling: %s\n' "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader 2>/dev/null | head -1)"
-        # A persisted profile that is not what the card is actually running is worth shouting about:
-        # it means someone applied something by hand, and the next reboot will silently change it.
+        local p="" co="" cc="" o="" c=""
         if [ -f "$PERSIST_CONF" ]; then
-            local p co cc o c
             p=$(grep -oE '^PROFILE=.*' "$PERSIST_CONF" | cut -d= -f2)
             co=$(grep -oE '^OC_OFFSET=.*' "$PERSIST_CONF" | cut -d= -f2)
             cc=$(grep -oE '^OC_CLK=.*' "$PERSIST_CONF" | cut -d= -f2)
             read -r o c _ < <(profile_point "$p" ${co:+"$co"} ${cc:+"$cc"})
+        fi
+        printf 'live offset : %s MHz\n' "$(cur_offset)"
+        # There is NO readback for the -lgc lock on this driver: clocks.max.sm is the VF-curve
+        # maximum (stock max + the offset), not the ceiling that was set, so do not present it as
+        # one. The honest check is the clock the card actually lands on under load.
+        printf 'live clock  : %s (idle unless loaded - the -lgc ceiling has no readback on this\n' \
+            "$(nvidia-smi --query-gpu=clocks.sm --format=csv,noheader 2>/dev/null | head -1)"
+        printf '              driver, so confirm it under load: 170tune try %s %s)\n' \
+            "${o:-<off>}" "${c:-<clk>}"
+        # A persisted profile that is not what the card is actually running is worth shouting about:
+        # it means someone applied something by hand, and the next reboot will silently change it.
+        if [ -f "$PERSIST_CONF" ]; then
             local live; live=$(cur_offset)
             if [ -n "${live:-}" ] && [ -n "${o:-}" ] && [ "$live" != "$o" ]; then
                 say "${c_warn}MISMATCH: persisted profile $p wants offset +$o, the card is running +$live."
