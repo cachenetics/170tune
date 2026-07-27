@@ -34,6 +34,8 @@ OCEFF=${OCEFF:-$(find_tool /usr/local/bin/oc_eff "$(user_home)/170hx/tools/oc_ef
 BENCH=${BENCH:-$(find_tool /usr/local/bin/170hx-sweep "$(dirname "$(readlink -f "$0")")/170hx-sweep" \
                            /usr/local/bin/170hx-test.sh "$(user_home)/170hx/tools/170hx-test.sh" "$HOME/170hx/tools/170hx-test.sh")}
 COMPUTE=${COMPUTE:-$(find_tool /usr/local/bin/compute_check "$(user_home)/170hx/tools/compute_check" "$HOME/170hx/tools/compute_check")}
+CTXPROBE=${CTXPROBE:-$(find_tool /usr/local/bin/ctx_probe "$(user_home)/170hx/tools/ctx_probe" "$HOME/170hx/tools/ctx_probe")}
+CTX_TIMEOUT=${CTX_TIMEOUT:-60}  # a context probe that hangs is a wedge, not a pass
 OCAPPLY=${OCAPPLY:-/usr/local/bin/170hx-oc}
 MEASURE_TIMEOUT=${MEASURE_TIMEOUT:-180}
 GATE_TEMP=${GATE_TEMP:-60}      # soak until HBM reaches this many C - gate HOT, never cold
@@ -61,6 +63,32 @@ wedged() {
     [[ "$c" == *"N/A"* || "$c" == *"Unable"* ]] && return 0
     "$NVML" 2>&1 | grep -qi "requires reset" && return 0
     return 1
+}
+
+# The wedge the checks above cannot see. After a hard kill of an inference server mid-context the
+# card can answer nvidia-smi normally, report no "requires reset" and read healthy clocks while no
+# process can create a CUDA context (torch: device_count()=1, is_available()=False). Measured on
+# the reference card, where 'recover' printed "card responds - recovered" over exactly that state
+# and the GPU stayed useless until the driver was reloaded by hand. Querying the card is not the
+# same as using it, so ask it to run something.
+#   0 = no context can be created (dead for every practical purpose)
+#   1 = a context works, OR the card is merely out of memory, OR there is no probe to ask with
+ctx_dead() {
+    local rc
+    if [ -x "$CTXPROBE" ]; then
+        timeout "$CTX_TIMEOUT" "$CTXPROBE" >/dev/null 2>&1; rc=$?
+    elif [ -x "$COMPUTE" ]; then
+        # fallback for an install predating ctx_probe: a 1 s compute check needs a context too.
+        # exit 1 there is a MISMATCH, not a context failure - the card is usable and wrong.
+        timeout "$CTX_TIMEOUT" "$COMPUTE" 1 256 >/dev/null 2>&1; rc=$?
+        [ "$rc" -eq 1 ] && return 1
+    else
+        return 1    # nothing to probe with: never claim a wedge we cannot demonstrate
+    fi
+    case "$rc" in
+        0|3) return 1 ;;    # usable (3 = ctx_probe's out-of-memory: a server owns the VRAM)
+        *)   return 0 ;;    # 2 = context refused, 124 = the probe hung. Both are wedged.
+    esac
 }
 
 # ---------------------------------------------------------------- armed marker
@@ -213,6 +241,10 @@ THREE FAILURE MODES, IN ORDER OF NASTINESS
   2. DEVICE FAULT - CUDA dies with illegal instruction / illegal memory access / cublas 14.
      Recoverable with 'recover', usually needs a driver reload.
   3. HANG - the GPU stops answering. Needs a reboot, sometimes a power cycle.
+  4. CONTEXT WEDGE - nvidia-smi answers, clocks read fine, NVML says nothing is wrong, and
+     no process can create a CUDA context (torch: device_count()=1, is_available()=False).
+     Seen after hard kills of a server mid-context. 'status' and 'recover' probe for this
+     by actually creating a context; do not trust a healthy-looking nvidia-smi here.
 
   Work going DOWN while the clock goes UP is a fourth signature worth knowing: past the wall
   the NAFLL stretches the clock instead of executing faster. +400/1650 reports a higher clock
@@ -232,6 +264,9 @@ cmd_status() {
     is_170hx || say "${c_warn}warning: GPU 0 device id $(devid) is not a 170HX${c_off}"
     if wedged; then
         say "${c_bad}GPU IS WEDGED - run: 170tune recover${c_off}"
+    elif ctx_dead; then
+        say "${c_bad}GPU ANSWERS BUT TAKES NO CUDA CONTEXT - it is unusable. Run: 170tune recover${c_off}"
+        say "${c_bad}  (clocks and NVML look healthy in this state - they are not evidence)${c_off}"
     fi
     printf 'serial      : %s\n' "$(serial)"
     printf 'offset      : %s MHz\n' "$(cur_offset)"
@@ -348,6 +383,10 @@ cmd_gate() {
         [ -n "$workload" ] || say "${c_warn}  NOTE: sweeps + GEMM only. A point can pass this and still fault under a real workload"
         [ -n "$workload" ] || say "  (measured: 3 profiles gated clean here and killed an inference server). Re-run with"
         [ -n "$workload" ] || say "  --workload '<your command>' to prove it against the thing you actually run.${c_off}"
+        # A rung that is not the production engine is the same mistake one level up: it proves a
+        # load nobody will run, and a fault peculiar to that engine rejects a point that serves fine.
+        [ -n "$workload" ] && say "${c_warn}  the workload was: $workload - this receipt is only worth something if that is${c_off}"
+        [ -n "$workload" ] && say "${c_warn}  the engine that will actually serve.${c_off}"
         write_receipt "$off" "$clk" "$n" "$tmax" "$workload"
         [ "$n" -ge 4 ] || say "${c_warn}  note: $n sweeps is a probe, not a gate. 'persist' wants 4 - see 'explain'.${c_off}"
         return 0
@@ -639,6 +678,13 @@ cmd_persist() {
                 say "${c_warn}  this receipt is sweeps + GEMM only - no real workload was run against it."
                 say "  three profiles with receipts like this killed an inference server on this card."
                 say "  before you rely on it in production:  170tune gate $off $clk 4 --workload '<your command>'${c_off}"
+            else
+                # A receipt names the workload it was gated with, and the reader has to check that
+                # it is the production one. Gating vLLM against an sglang rung certifies the point
+                # against a load it will never see, and can reject a good point over a fault only
+                # the untested engine has - both happened on the reference card.
+                say "${c_warn}  the workload on this receipt was:  $(grep -oE '"workload": "[^"]*"' "$rf" | cut -d'"' -f4)"
+                say "  if that is not the engine that will serve, it is closer to no workload than to a real one.${c_off}"
             fi
         fi
     fi
@@ -675,18 +721,33 @@ cmd_recover() {
     nvidia-smi -rgc >/dev/null 2>&1 && say "   clock lock cleared"
     nvidia-smi -pl 250 >/dev/null 2>&1 && say "   power limit back to 250 W"
     disarm
-    if ! wedged; then
-        say "${c_ok}card responds - recovered${c_off}"; nvidia-smi --query-gpu=clocks.sm,memory.total --format=csv,noheader
+    # "Responds" is not "recovered". Prove a CUDA context can still be created before claiming it:
+    # the card can pass every query-based check and refuse every context. See ctx_dead().
+    if ! wedged && ! ctx_dead; then
+        say "${c_ok}card responds and takes a CUDA context - recovered${c_off}"
+        nvidia-smi --query-gpu=clocks.sm,memory.total --format=csv,noheader
         return 0
     fi
-    say "${c_warn}card still wedged - trying a driver reload${c_off}"
+    if wedged; then
+        say "${c_warn}card still wedged - trying a driver reload${c_off}"
+    else
+        say "${c_warn}nvidia-smi answers but no process can create a CUDA context${c_off}"
+        say "  (the state where torch reports device_count()=1 with is_available()=False)"
+        say "${c_warn}  going straight to a driver reload - clearing offsets cannot fix this${c_off}"
+    fi
     systemctl stop nvidia-persistenced gpu-fan-curve 2>/dev/null
     fuser -k /dev/nvidia* 2>/dev/null
     modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>&1 | head -2
     modprobe nvidia 2>&1 | head -2
     systemctl start nvidia-persistenced gpu-fan-curve 2>/dev/null
     sleep 3
-    if ! wedged; then say "${c_ok}driver reload recovered it${c_off}"; return 0; fi
+    if ! wedged && ! ctx_dead; then say "${c_ok}driver reload recovered it${c_off}"; return 0; fi
+    if ! wedged; then
+        say "${c_bad}the driver reloaded and nvidia-smi answers, but a CUDA context still cannot be created."
+        say "  Check that nothing is holding /dev/nvidia* (fuser -v /dev/nvidia*) and reload again."
+        say "  If it persists, this is the reboot case - do not trust the healthy-looking nvidia-smi.${c_off}"
+        return 1
+    fi
     say "${c_bad}still wedged after a driver reload."
     say "  next step: reboot. If it is still wedged after a reboot, it needs a real power cycle"
     say "  (a warm reboot leaves the card powered). That is hands-on-the-box work.${c_off}"
@@ -727,7 +788,11 @@ COMMANDS
                               GEMM are a narrower instruction mix than a real application, and
                               three profiles that passed this gate on the reference card killed
                               an inference server within seconds. --workload runs YOUR command
-                              as the last rung and records that it survived.
+                              as the last rung and records that it survived. Make it the engine
+                              that will actually SERVE: a rung running a different engine
+                              certifies the point against a load it will never see, and can
+                              reject a good point over a fault only that engine has. There is a
+                              worked vLLM rung in vllm_workload_check.sh - copy its shape.
   quarantine <off> <clk> --reason "..."
                               record a point as known-bad on this card - the thing the gate
                               missed. persist then refuses it even with a passing receipt.
@@ -756,7 +821,9 @@ COMMANDS
   reset                       back to stock now: offset 0, no clock lock, 250 W.
   recover                     after a fault or hang: clear offsets and locks, reload the driver
                               if the card is wedged, and escalate honestly to reboot or power
-                              cycle if that does not work.
+                              cycle if that does not work. It will not call the card recovered
+                              until a CUDA context can actually be created on it - the card can
+                              answer nvidia-smi perfectly while every process fails to get one.
   boot-check                  systemd oneshot. If a tuning run did not check in before the
                               machine went down, revert to stock and record what was in flight.
 
