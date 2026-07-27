@@ -274,10 +274,26 @@ here.
 
 ## Attribution
 
-The hard parts belong to other projects. The 64 GB memory unlock is
-amoghmunikote/cmpunlocker (a runtime unlock via patched open GPU kernel modules, no
-VBIOS flash). The PCIe Gen2 link work is bendy2's patches (in-driver retrain, since
-merged into the cmpunlocker Gen2 branch). 170tune contributes what sits on top:
-tuning, measurement discipline, the integrity gate, and recovery. If you only take
+The hard parts belong to other projects.
+
+The 64 GB memory unlock is amoghmunikote/cmpunlocker: a runtime unlock via patched
+open GPU kernel modules, no VBIOS flash.
+
+The PCIe Gen2 link work is bendy2's patches, an in-driver retrain, since merged into
+the cmpunlocker Gen2 branch.
+
+The FBPA memory-PLL map is asm64-hooligan's mem_overclock fork of cmpunlocker: the
+per-partition register locations (cfg at +0x3C90, coefficient at +0x3C98, base
+0x900000 + i*0x4000), the coefficient encoding, and the FBPA_PLL priv-level-mask
+entry 0x009a3c7c that opens in the post-BooterLoad window. The memory-clock section
+of the guide is built on that map. Our measurements disagree with the conclusion -
+raising the memory PLL does not raise delivered bandwidth on this part, because the
+DRAM runs at the rate it was trained at, and the stacks already ship at 3.456 Gbps
+per pin - but the register work is sound and finding it independently would have
+cost weeks. Running that same lever downward is what proved the PLL genuinely
+reaches the DRAM, and it is a usable power saving in its own right.
+
+170tune contributes what sits on top: tuning, measurement discipline, the integrity
+gate, and recovery. If you only take
 one idea from this repo, take the gate rule: on this card, "it did not crash" is not
 a result.
