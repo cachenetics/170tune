@@ -4,7 +4,7 @@ How to run an NVIDIA CMP 170HX well, and a record of what is closed and why so n
 dead end gets walked twice.
 
 Reference card: serial 1322621047793 (GA100, 70 SM, 64 GB HBM2e unlocked, driver
-610.43.03, stock 300W VBIOS 92.00.6D.00.0A, PCIe Gen2 x4), host "a reference host". All tuning
+610.43.03, stock 300W VBIOS 92.00.6D.00.0A, PCIe Gen2 x4), on a single-card test host. All tuning
 numbers below were measured on this card unless stated otherwise. Per-card silicon
 varies; see "Qualifying a new card" before you trust any offset on a different serial.
 
@@ -445,7 +445,7 @@ Offsets and power limits are volatile: lost on every driver reload and reboot. T
 - `After=nvidia-persistenced.service gen2-hammer.service`
 - `ExecStart=/usr/local/bin/170hx-oc eff`
 - `ExecStop=/usr/local/bin/170hx-oc stock`
-- Enabled on a reference host.
+- Enable it on any host that runs a tuned card.
 
 Multi-card guard: the script guards on PCI device id 0x20C2 and loops over every GPU,
 because this host is a qualification bench and cards are swapped constantly. A non-170HX
@@ -474,7 +474,7 @@ on another card. Ladder:
    for the full-VRAM memory sweep and compute checksum at the candidate point.
 4. Stop at the first step that shows a device fault, and back off one FULL step, not one
    bin.
-5. Record the result in `~ariel/170hx/results/<serial>/`.
+5. Record the result under `/var/lib/170tune/results/<serial>/` (170tune qualify does this).
 
 The gate is the pattern sweep, not "it ran". A silent corruptor (see the cliff in
 section 4) passes any test that only checks whether the kernel finished. Run 4 sweeps and

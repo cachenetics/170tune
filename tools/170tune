@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # 170tune - measure, qualify and recover clock/voltage settings on a CMP 170HX.
 #
-# Named to match a family of per-domain tuning suites.
-#
 # Built because the failure that matters on this card is not a crash. An overclock can complete
 # every benchmark, throw no Xid, never hang, and silently return wrong bytes - intermittently.
 # So this tool separates "it ran" from "it is safe", records what it was doing before a hang, and
