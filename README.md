@@ -40,14 +40,45 @@ sudo install tools/170tune tools/170hx-oc nvml_oc /usr/local/bin/
 sudo 170tune selftest    # prove the detectors work before trusting any PASS
 sudo 170tune ladder 1350 # walk the offset up at one ceiling, gating each rung
 sudo 170tune gate 300 1350 4   # 4 soaked sweeps + compute check; exit 0 = gated
-sudo 170tune apply eff   # make a gated profile live (not persistent by itself)
+sudo 170tune apply eff         # live now - gone on the next driver reload or reboot
+sudo 170tune persist eff       # live now AND at every boot
 ```
 
 `qualify [clk]` runs the whole per-card flow and records it to
 `/var/lib/170tune/results/<serial>/oc.json` without changing anything permanently.
-Adopting a result is a separate, deliberate step: edit `ExecStart` in
-`/etc/systemd/system/170hx-oc.service`. A good measurement can never promote itself
-into production by accident.
+A good measurement can never promote itself into production by accident: adopting one
+is a separate, deliberate verb.
+
+### Applying, and making it stick
+
+Offsets and clock locks are volatile - the driver forgets them on every reload and
+every reboot - so there are two verbs:
+
+```
+sudo 170tune apply   eff              # this boot only
+sudo 170tune apply   eff --persist    # same thing, then persist it
+sudo 170tune persist eff              # now and at every boot
+sudo 170tune persist custom 275 1380  # a per-card point, e.g. what qualify recommended
+sudo 170tune persist status           # what is persisted vs. what the card is running
+sudo 170tune persist off              # revert to stock, and come up stock from now on
+```
+
+`persist` writes `/etc/170tune/profile` (`PROFILE=`, plus `OC_OFFSET=`/`OC_CLK=` for a
+custom point), enables the `170hx-oc.service` oneshot that reads it at boot, applies
+the profile immediately, and then reads the card back to check it actually took -
+rather than trusting that a unit exiting 0 means the silicon changed.
+
+**It refuses a point this card has not gated.** Every number in the profile table came
+off serial 1322621047793; another card's silicon is not that card's silicon. `gate`
+writes a receipt per serial, and `persist` demands one that is (a) present for this
+exact offset/ceiling, (b) at least four sweeps, and (c) gated hot - a receipt whose
+peak HBM temperature never reached `GATE_TEMP` is rejected, because a cold gate is
+precisely how +325/1400 got blessed before it corrupted memory at 59 C. `--force`
+overrides all three, loudly, and says so in the output.
+
+`persist off` disables the unit and puts the card back to stock explicitly, rather
+than relying on `ExecStop` having run - if the unit was never active, stopping it
+reverts nothing.
 
 Exit codes: 0 success / gated, 1 rejected / faulted / failed, 2 usage error or hang.
 
@@ -252,16 +283,19 @@ COMPUTE=/path         the compute checker        NVML=/path   nvml_oc
 
 ```
 tools/170tune           the harness: explain, status, try, gate, ladder, qualify,
-                        selftest, apply, reset, recover, boot-check
-tools/170hx-oc          profile applier (+ systemd unit for boot persistence)
+                        selftest, apply, persist, reset, recover, boot-check
+tools/170hx-oc          profile applier: named profiles plus 'custom <off> <clk>'
+systemd/170hx-oc.service        boot persistence; reads /etc/170tune/profile
+systemd/170tune-bootcheck.service  reverts a setting that was in flight at a crash
 tools/nvml_oc.c         query/apply GPC and MEM VF offsets via NVML
 tools/compute_check.cu  bit-exact GEMM checker: same deterministic bf16 GEMM
                         repeated and compared bit for bit, catches silent COMPUTE
                         corruption the memory sweep cannot see
 tools/oc_eff.cu         sustained bf16 GEMM with in-process NVML power sampling
 tools/mem_probe.cu      streaming bandwidth + dependent-load latency probes
-docs/170hx-tuning-guide.md   the long-form findings
-analysis/oc_matrix.md        the full offset x clock-ceiling measurement matrix
+docs/tuning-guide.md         the long-form findings
+docs/measurement-matrix.md   the full offset x clock-ceiling measurement matrix
+install.sh              build the probes, install the tools, enable boot-check
 ```
 
 ## License

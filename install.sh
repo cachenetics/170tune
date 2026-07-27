@@ -21,9 +21,13 @@ sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_
 sudo mkdir -p /var/lib/170tune
 
 if [ -d /etc/systemd/system ]; then
-  say "installing units (boot-check enabled; the profile applier is NOT enabled by default)"
+  say "installing units (boot-check enabled; the profile applier is installed but NOT enabled -"
+  say "  '170tune persist <profile>' is what puts a profile in the boot path, and it wants a gate"
+  say "  receipt from this card first. Installing overclocks nothing.)"
   sudo install -m 644 systemd/170tune-bootcheck.service /etc/systemd/system/
-  sudo install -m 644 systemd/170hx-oc.service /etc/systemd/system/ 2>/dev/null || true
+  sudo install -m 644 systemd/170hx-oc.service /etc/systemd/system/
+  sudo install -d -m 755 /usr/share/170tune
+  sudo install -m 644 systemd/170hx-oc.service /usr/share/170tune/
   sudo systemctl daemon-reload
   sudo systemctl enable 170tune-bootcheck.service
 fi
@@ -32,6 +36,8 @@ say ""
 say "installed. Next:"
 say "  170tune explain      what the levers are"
 say "  sudo 170tune selftest    prove the detectors work on this box"
+say "  sudo 170tune gate 300 1350 4   prove a point on THIS card"
+say "  sudo 170tune persist eff       adopt it, now and at every boot"
 say ""
 say "NOTE: 170tune needs a full-VRAM integrity sweep to gate against. It looks for"
 say "170hx-test.sh; point it at your own with BENCH=/path/to/sweep. Without one, gate"
