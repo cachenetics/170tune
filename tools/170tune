@@ -13,13 +13,17 @@
 #   gate    <off> <clk> [n]       run the full-VRAM pattern sweep n times (this is what proves it)
 #   ladder  <clk> [start] [step]  walk the offset up at one ceiling until it breaks, gating each step
 #   qualify [clk]                 full per-card flow, writes results/<serial>/oc.json
-#   apply   <profile> | reset     hand off to 170hx-oc
+#   apply   <profile> | reset     hand off to 170hx-oc (this boot only)
+#   persist <profile>|off|status  make a gated profile survive reboots (systemd unit)
 #   selftest                      prove the harness still detects a known-bad point
 #   recover                       put the card back, escalating honestly if it is wedged
 #   boot-check                    (systemd) revert if the last run never checked in
 set -uo pipefail
 
-STATE=/var/lib/170tune
+STATE=${STATE:-/var/lib/170tune}
+PERSIST_CONF=${PERSIST_CONF:-/etc/170tune/profile}
+PERSIST_UNIT=${PERSIST_UNIT:-170hx-oc.service}
+UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 # Paths must survive sudo, where $HOME becomes /root. Resolve against the INVOKING user's home.
 user_home() { getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6; }
 find_tool() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
@@ -66,6 +70,22 @@ EOF
     sync
 }
 disarm() { rm -f "$STATE/armed.json"; }
+
+# ---------------------------------------------------------------- gate receipts
+# A receipt is written ONLY by a gate that passed, and it is per serial: it is the evidence
+# 'persist' demands before it will let a point survive a reboot. Silicon varies card to card, so
+# a receipt from another card proves nothing about this one and is deliberately not portable.
+receipt_file() { printf '%s/gated/%s/off%s_clk%s.json' "$STATE" "$(serial)" "$1" "$2"; }
+write_receipt() {
+    local off=$1 clk=$2 n=$3 tmax=$4 f; f=$(receipt_file "$off" "$clk")
+    mkdir -p "$(dirname "$f")"
+    cat > "$f" <<EOF
+{"serial": "$(serial)", "offset": $off, "ceiling": $clk, "sweeps": $n, "peak_hbm_c": ${tmax:-0},
+ "compute_check": $([ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ] && echo true || echo false),
+ "gated": "$(date -Is)"}
+EOF
+    sync
+}
 
 # ---------------------------------------------------------------- apply / read
 apply_point() {
@@ -246,6 +266,8 @@ cmd_gate() {
     if [ "$fails" -eq 0 ]; then
         say "${c_ok}GATED: offset=+$off ceiling=$clk passed $n/$n sweeps + compute (peak HBM ${tmax}C)${c_off}"
         [ "${tmax:-0}" -lt "$GATE_TEMP" ] 2>/dev/null && say "${c_warn}  CAUTION: HBM never reached ${GATE_TEMP}C (peaked ${tmax}C). Optimistic - raise GATE_SOAK_MAX.${c_off}"
+        write_receipt "$off" "$clk" "$n" "$tmax"
+        [ "$n" -ge 4 ] || say "${c_warn}  note: $n sweeps is a probe, not a gate. 'persist' wants 4 - see 'explain'.${c_off}"
         return 0
     fi
     say "${c_bad}REJECTED: $fails/$n sweeps failed. Do not ship this point.${c_off}"
@@ -310,7 +332,13 @@ cmd_qualify() {
 }
 EOF
     say "${c_ok}recorded: $STATE/results/$s/oc.json${c_off}"
-    say "nothing was made persistent - to adopt it: 170hx-oc <profile>, or edit 170hx-oc.service"
+    if [ -n "$ship" ]; then
+        say "nothing was made persistent. To adopt this card's own point:"
+        say "    170tune apply   custom $ship $clk              (now, this boot only)"
+        say "    170tune persist custom $ship $clk              (now and at every boot)"
+    else
+        say "nothing was made persistent, and nothing gated clean - there is no point to adopt."
+    fi
 }
 
 # selftest - a PASS from this harness only means something if the harness can still detect a
@@ -381,6 +409,152 @@ FAKE
     return $rc
 }
 
+# ---------------------------------------------------------------- apply / persist
+# apply    = live now, gone on the next driver reload or reboot (offsets are volatile).
+# persist  = the same thing, plus a systemd oneshot that re-applies it at every boot.
+# They are separate verbs on purpose, and persist demands a gate receipt for THIS serial,
+# because the whole point of this harness is that "it ran" is not "it is safe".
+
+# Read a profile's point out of 170hx-oc rather than keeping a second copy of the table here.
+profile_point() { "$OCAPPLY" --print "$@" 2>/dev/null; }
+
+cmd_apply() {
+    local persist=0 args=()
+    for a in "$@"; do
+        case "$a" in --persist) persist=1 ;; *) args+=("$a") ;; esac
+    done
+    [ "${#args[@]}" -gt 0 ] || die "usage: 170tune apply <profile> [--persist]   (or: apply custom <off> <clk>)"
+    "$OCAPPLY" "${args[@]}" || return 1
+    [ "$persist" = 1 ] || return 0
+    say ""
+    cmd_persist "${args[@]}"
+}
+
+persist_write_conf() {
+    local prof=$1 off=${2:-} clk=${3:-}
+    mkdir -p "$(dirname "$PERSIST_CONF")"
+    {
+        echo "# written by '170tune persist' on $(date -Is). Read by $PERSIST_UNIT at boot."
+        echo "# Edit through 170tune, not by hand: persist checks for a gate receipt first."
+        echo "PROFILE=$prof"
+        [ -n "$off" ] && echo "OC_OFFSET=$off"
+        [ -n "$clk" ] && echo "OC_CLK=$clk"
+    } > "$PERSIST_CONF"
+    chmod 644 "$PERSIST_CONF"
+    sync
+}
+
+cmd_persist() {
+    need_root persist "$@"
+    local force=0 args=()
+    for a in "$@"; do
+        case "$a" in -f|--force) force=1 ;; *) args+=("$a") ;; esac
+    done
+    local prof=${args[0]:-status}
+
+    case "$prof" in
+      status)
+        if [ -f "$PERSIST_CONF" ]; then
+            say "${c_hi}persisted:${c_off}"; sed 's/^/            /' "$PERSIST_CONF"
+        else
+            say "persisted: ${c_warn}nothing${c_off} (no $PERSIST_CONF) - this card comes up stock"
+        fi
+        local en act
+        en=$(systemctl is-enabled "$PERSIST_UNIT" 2>&1); act=$(systemctl is-active "$PERSIST_UNIT" 2>&1)
+        printf 'unit        : %s (%s / %s)\n' "$PERSIST_UNIT" "$en" "$act"
+        printf 'live offset : %s MHz\n' "$(cur_offset)"
+        printf 'live ceiling: %s\n' "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader 2>/dev/null | head -1)"
+        # A persisted profile that is not what the card is actually running is worth shouting about:
+        # it means someone applied something by hand, and the next reboot will silently change it.
+        if [ -f "$PERSIST_CONF" ]; then
+            local p co cc o c
+            p=$(grep -oE '^PROFILE=.*' "$PERSIST_CONF" | cut -d= -f2)
+            co=$(grep -oE '^OC_OFFSET=.*' "$PERSIST_CONF" | cut -d= -f2)
+            cc=$(grep -oE '^OC_CLK=.*' "$PERSIST_CONF" | cut -d= -f2)
+            read -r o c _ < <(profile_point "$p" ${co:+"$co"} ${cc:+"$cc"})
+            local live; live=$(cur_offset)
+            if [ -n "${live:-}" ] && [ -n "${o:-}" ] && [ "$live" != "$o" ]; then
+                say "${c_warn}MISMATCH: persisted profile $p wants offset +$o, the card is running +$live."
+                say "  the next reboot will apply +$o. Re-run: 170tune persist $p${c_off}"
+            fi
+        fi
+        [ -d "$STATE/gated/$(serial)" ] && { say "gate receipts for this card:"; ls -1 "$STATE/gated/$(serial)" | sed 's/^/            /'; }
+        return 0 ;;
+      off)
+        say "-- removing boot persistence"
+        systemctl disable --now "$PERSIST_UNIT" 2>&1 | sed 's/^/   /'   # --now runs ExecStop => back to stock
+        rm -f "$PERSIST_CONF"
+        systemctl daemon-reload 2>/dev/null
+        # Do not rely on ExecStop having run: if the unit was never active (condition unmet, or a
+        # hand-applied profile), --now reverts nothing. Put the card back explicitly.
+        "$OCAPPLY" stock 2>&1 | sed 's/^/   /'
+        say "${c_ok}persistence off - this card now comes up stock${c_off}"
+        say "   the card is at: offset $(cur_offset) MHz"
+        return 0 ;;
+    esac
+
+    # ---- resolve the requested point
+    local off clk pl
+    read -r off clk pl < <(profile_point "${args[@]}")
+    [ -n "${off:-}" ] || die "unknown profile '${args[*]}' - see '170tune --help' for the list, or: persist custom <off> <clk>"
+
+    # ---- evidence check. stock needs none; everything else needs a receipt from THIS card.
+    if [ "$prof" != "stock" ]; then
+        local rf; rf=$(receipt_file "$off" "$clk")
+        local sweeps=0 peak=0
+        [ -f "$rf" ] && sweeps=$(grep -oE '"sweeps": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
+        [ -f "$rf" ] && peak=$(grep -oE '"peak_hbm_c": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
+        if [ ! -f "$rf" ]; then
+            say "${c_bad}NOT GATED on this card (serial $(serial)): no receipt for offset=+$off ceiling=$clk${c_off}"
+            say "  the numbers in the profile table are the REFERENCE card's silicon, not yours."
+            say "  prove it here first:  170tune gate $off $clk 4"
+            [ "$force" = 1 ] || return 1
+            say "${c_warn}  --force: persisting an unproven point anyway${c_off}"
+        elif [ "${sweeps:-0}" -lt 4 ]; then
+            say "${c_warn}thin evidence: the receipt for +$off/$clk is only ${sweeps} sweep(s).${c_off}"
+            say "  the corruption at +325/1400 passed 4 cold sweeps and still failed hot - see 'explain'."
+            say "  strengthen it:  170tune gate $off $clk 4"
+            [ "$force" = 1 ] || return 1
+            say "${c_warn}  --force: persisting on ${sweeps} sweep(s) anyway${c_off}"
+        elif [ "${peak:-0}" -lt "$GATE_TEMP" ]; then
+            # A cold gate is the documented way to bless a setting that fails in service: +325/1400
+            # passed 4/4 sweeps at 37-43C HBM and returned mem_errors=4 after a soak to 59C.
+            say "${c_warn}cold receipt: +$off/$clk was gated with HBM peaking at only ${peak}C (want ${GATE_TEMP}C).${c_off}"
+            say "  hot silicon needs more voltage, so an undervolt that passes cold can corrupt hot."
+            say "  re-gate hot:  GATE_SOAK_MAX=300 170tune gate $off $clk 4"
+            [ "$force" = 1 ] || return 1
+            say "${c_warn}  --force: persisting on a cold gate anyway${c_off}"
+        else
+            say "${c_ok}gate receipt found: +$off/$clk passed $sweeps sweeps at ${peak}C HBM on this card${c_off}"
+            sed 's/^/            /' "$rf"
+        fi
+    fi
+
+    # ---- install the unit, write the conf, enable, apply now
+    if [ ! -f "$UNIT_DIR/$PERSIST_UNIT" ]; then
+        local src; src="$(dirname "$(readlink -f "$0")")/../systemd/$PERSIST_UNIT"
+        [ -f "$src" ] || src="/usr/share/170tune/$PERSIST_UNIT"
+        [ -f "$src" ] || die "$PERSIST_UNIT not installed and no copy found - run install.sh"
+        install -m 644 "$src" "$UNIT_DIR/$PERSIST_UNIT"
+        say "   installed $UNIT_DIR/$PERSIST_UNIT"
+    fi
+    persist_write_conf "$prof" "${args[1]:-${OC_OFFSET:-}}" "${args[2]:-${OC_CLK:-}}"
+    systemctl daemon-reload
+    systemctl enable "$PERSIST_UNIT" 2>&1 | sed 's/^/   /'
+    systemctl restart "$PERSIST_UNIT" || die "the unit failed to apply - check: systemctl status $PERSIST_UNIT"
+
+    # ---- verify the card actually took it, rather than trusting that the unit exited 0
+    local live; live=$(cur_offset)
+    if [ "${live:-x}" = "$off" ]; then
+        say "${c_ok}PERSISTED: profile $prof (offset +$off, ceiling ${clk}) is live and will re-apply at boot${c_off}"
+    else
+        say "${c_warn}persisted profile $prof, but the card reads offset +${live:-?} (expected +$off)${c_off}"
+        say "  check: systemctl status $PERSIST_UNIT"
+    fi
+    say "   undo with: 170tune persist off"
+    return 0
+}
+
 cmd_recover() {
     need_root "$@"
     say "-- clearing offsets and clock locks"
@@ -444,8 +618,20 @@ COMMANDS
                               /var/lib/170tune/results/<serial>/oc.json. Changes nothing
                               permanently - adopting a result is a separate, deliberate step.
   selftest [--physical]       prove the detectors still work before trusting any PASS.
-  apply   <profile>           make a profile live NOW (see PROFILES). Not persistent by itself.
-  reset                       back to stock: offset 0, no clock lock, 250 W.
+  apply   <profile> [--persist]
+                              make a profile live NOW (see PROFILES). Offsets are volatile, so
+                              this is gone on the next driver reload or reboot unless you add
+                              --persist, which is exactly 'persist' below.
+  persist <profile>           make it survive reboots: writes /etc/170tune/profile, enables the
+                              170hx-oc.service oneshot, applies it now, and verifies the card
+                              actually took it. REFUSES a point this card has not gated - the
+                              profile table is the reference card's silicon, not yours. --force
+                              overrides, loudly.
+  persist custom <off> <clk>  persist a per-card point (what 'qualify' recommends for yours).
+  persist status              what is persisted, whether the unit is enabled, whether the live
+                              card matches it, and which points this serial has gated.
+  persist off                 disable the unit, revert to stock, and come up stock from now on.
+  reset                       back to stock now: offset 0, no clock lock, 250 W.
   recover                     after a fault or hang: clear offsets and locks, reload the driver
                               if the card is wedged, and escalate honestly to reboot or power
                               cycle if that does not work.
@@ -461,9 +647,10 @@ PROFILES (applied by 170hx-oc, which 'apply' calls)
   perf      +350 / 1590       212.2 TF @ 181.2 W    throughput first, still under stock power
   max       +350 / 1650       215.3 TF @ 186.1 W    peak validated throughput
 
-  'apply' changes the running card only. To make a profile survive a reboot, edit ExecStart in
-  /etc/systemd/system/170hx-oc.service - deliberately a manual step, so a good measurement can
-  never promote itself into production by accident.
+  The numbers above are the REFERENCE card, serial 1322621047793. Per-card silicon varies: gate
+  the point on your own card and persist that ('qualify' recommends one, 'persist custom' adopts
+  it). 'apply' changes the running card only; 'persist' is the deliberate second step that puts
+  it in the boot path, and it will not do so for a point this card has not gated.
 
 ENVIRONMENT
   GATE_TEMP=60          HBM temperature to soak to before every sweep. Gating a cold card is
@@ -483,7 +670,8 @@ TYPICAL SESSION
   170tune selftest
   170tune ladder 1350
   170tune gate 300 1350 4
-  170tune apply eff
+  170tune apply eff --persist
+  170tune persist status
 EOF
 }
 
@@ -495,8 +683,9 @@ case "${1:-}" in
     gate)       shift; need_root gate "$@"; cmd_gate "$@" ;;
     ladder)     shift; need_root ladder "$@"; cmd_ladder "$@" ;;
     qualify)    shift; need_root qualify "$@"; cmd_qualify "$@" ;;
-    apply)      shift; exec "$OCAPPLY" "${1:?profile}" ;;
-    reset)      exec "$OCAPPLY" stock ;;
+    apply)      shift; need_root apply "$@"; cmd_apply "$@" ;;
+    persist)    shift; cmd_persist "$@" ;;
+    reset)      need_root reset; exec "$OCAPPLY" stock ;;
     selftest)   shift; need_root selftest "$@"; cmd_selftest "$@" ;;
     recover)    shift; cmd_recover "$@" ;;
     boot-check) shift; cmd_boot_check "$@" ;;

@@ -46,6 +46,13 @@
 # Memory offsets are refused by the driver on this part (allowed range [0..0]) - there is none to set.
 set -uo pipefail
 
+USAGE="usage: $0 [stock|dense|eff|match|balanced|perf|max]
+       $0 custom <offset> <ceiling>      (or set OC_OFFSET/OC_CLK in the environment)
+       $0 --print <profile>              print 'OFFSET CLK PL' and exit, apply nothing"
+
+PRINT=0
+if [ "${1:-}" = "--print" ]; then PRINT=1; shift; fi
+
 PROFILE="${1:-eff}"
 case "$PROFILE" in
   stock)    OFFSET=0   ; CLK=""     ; PL=250 ;;
@@ -55,8 +62,21 @@ case "$PROFILE" in
   balanced) OFFSET=300 ; CLK=1470   ; PL=300 ;;
   perf)     OFFSET=350 ; CLK=1590   ; PL=300 ;;
   max)      OFFSET=350 ; CLK=1650   ; PL=300 ;;
-  *) echo "usage: $0 [stock|dense|eff|match|balanced|perf|max]" >&2; exit 2 ;;
+  # A per-card point that '170tune qualify' found and '170tune gate' proved. The named profiles
+  # above are the reference card's silicon; another card's ship point belongs here, not in a
+  # profile name that implies it was measured on yours.
+  custom)   OFFSET="${2:-${OC_OFFSET:-}}" ; CLK="${3:-${OC_CLK:-}}" ; PL="${OC_PL:-300}"
+            case "${OFFSET:-x}${CLK:-x}" in
+              *x*) echo "170hx-oc: custom needs an offset and a ceiling (args or OC_OFFSET/OC_CLK)" >&2; exit 2 ;;
+            esac
+            case "$OFFSET$CLK" in *[!0-9]*) echo "170hx-oc: custom offset/ceiling must be integers" >&2; exit 2 ;; esac
+            [ "$OFFSET" -le 450 ] || { echo "170hx-oc: refusing offset +$OFFSET - above +450 hard-crashes this part" >&2; exit 2; }
+            ;;
+  *) echo "$USAGE" >&2; exit 2 ;;
 esac
+
+# --print is how 170tune reads this table without duplicating it.
+[ "$PRINT" = 1 ] && { printf '%s %s %s\n' "$OFFSET" "${CLK:-none}" "$PL"; exit 0; }
 
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi missing"; exit 1; }
 [ -x /usr/local/bin/nvml_oc ] || { echo "/usr/local/bin/nvml_oc missing"; exit 1; }
