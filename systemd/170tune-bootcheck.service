@@ -1,0 +1,12 @@
+[Unit]
+Description=Revert 170HX tuning if the last run did not check in before the machine went down
+After=nvidia-persistenced.service
+Before=170hx-oc.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/170tune boot-check
+
+[Install]
+WantedBy=multi-user.target

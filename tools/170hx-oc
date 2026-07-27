@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# 170hx-oc - apply a validated clock/voltage profile to every CMP 170HX on this host.
+#
+# THE PRIMITIVE (proven at a pinned clock, card 1322621047793):
+#   nvmlDeviceSetGpcClkVfOffset(+X) shifts the voltage/frequency curve - at every voltage point
+#   the clock is X MHz higher - which is the same thing as saying a target clock is now reached
+#   at a LOWER voltage. Measured, same clock and same work, offset 0 -> +300:
+#       pinned 1200 MHz : 130.6 W -> 120.6 W   (-7.7%)
+#       pinned 1350 MHz : 174.6 W -> 132.0 W   (-24.4%)
+#   Power tracks V^2*f, so the saving grows with frequency. The driver exposes no voltage
+#   telemetry on this SKU, so watts-at-fixed-clock is the proxy - and it is unambiguous.
+#
+#   Therefore: offset alone does nothing for efficiency - it just lets the arbiter climb higher.
+#   You must ALSO pin where it lands. Capping POWER works but lets the clock oscillate; capping
+#   the CLOCK (-lgc) holds one voltage point and is measurably better. Hence every profile here
+#   is "offset, power limit wide open, clock ceiling set".
+#
+#   -lgc is set as 210,<max> (not <max>,<max>) so the card still idles down to 210 MHz / ~54 W.
+#
+# MEASURED PROFILES (sustained bf16 GEMM, NVML power sampled in-process; every one passed the
+# full-VRAM pattern sweep with mem_errors=0 at least twice):
+#   profile    offset  clk max   bf16 TFLOPS   watts   GFLOPS/W   vs stock
+#   stock        +0    (none)       184.3      199.2      925      -
+#   dense       +250    1200        160.8      120.2     1337     -13% perf, -40% power
+#   eff         +300    1350        180.8      131.2     1378      -2% perf, -34% power  (DEFAULT)
+#   match       +250    1400        186.5      142.2     1311      stock perf, -29% power
+#   balanced    +300    1470        196.2      149.7     1311      +6% perf, -25% power
+#   perf        +350    1590        212.2      181.2     1171     +15% perf, -9% power
+#   max         +350    1650        215.3      186.1     1157     +17% perf at stock power
+#
+# THE VOLTAGE FLOOR, AND WHICH END OF IT TO SHIP. The safe offset is a function of the clock: at
+# 1400 the cliff is +325, but at 1350 the rail bottoms out and power goes FLAT long before anything
+# breaks. Measured at a 1350 ceiling: +150 146.0 W | +200 140.9 | +250 132.4 | +300 131.3 |
+# +350 132.1 | +400 131.5 | +450 132.5. So the floor STARTS at ~+250 and everything above is the
+# same wattage.
+#   => Ship the LOWEST offset that reaches the floor, not the highest that appears to work.
+# Learned the hard way: this profile shipped at +400/1350 for one round on the strength of two clean
+# sweeps, and then threw mem_errors=1 on a later sweep. +250 buys the identical 132 W with ~150 MHz
+# of margin, and passed a 4-sweep gate clean. Two clean sweeps is NOT a gate for an intermittent
+# fault mode - use four, and prefer margin over a number that looks equal on paper.
+#
+# LIMITS (measured - do not exceed): +350 is the highest offset validated clean, and only at the
+# high-clock profiles where RM picks a higher voltage; +375 faults at 1400 and +450 hard-crashes the
+# GPU ("GPU requires reset", wants a power cycle). Clock ceilings above 1650 buy nothing: 1700 and
+# 1740 both deliver ~1600 MHz, so 1604-1614 is the silicon ceiling at +350.
+# Memory offsets are refused by the driver on this part (allowed range [0..0]) - there is none to set.
+set -uo pipefail
+
+PROFILE="${1:-eff}"
+case "$PROFILE" in
+  stock)    OFFSET=0   ; CLK=""     ; PL=250 ;;
+  dense)    OFFSET=250 ; CLK=1200   ; PL=300 ;;
+  eff)      OFFSET=300 ; CLK=1350   ; PL=300 ;;
+  match)    OFFSET=250 ; CLK=1400   ; PL=300 ;;
+  balanced) OFFSET=300 ; CLK=1470   ; PL=300 ;;
+  perf)     OFFSET=350 ; CLK=1590   ; PL=300 ;;
+  max)      OFFSET=350 ; CLK=1650   ; PL=300 ;;
+  *) echo "usage: $0 [stock|dense|eff|match|balanced|perf|max]" >&2; exit 2 ;;
+esac
+
+command -v nvidia-smi >/dev/null || { echo "nvidia-smi missing"; exit 1; }
+[ -x /usr/local/bin/nvml_oc ] || { echo "/usr/local/bin/nvml_oc missing"; exit 1; }
+
+nvidia-smi -pm 1 >/dev/null 2>&1
+
+applied=0
+while IFS=, read -r idx devid serial; do
+  idx="${idx// /}"; devid="${devid// /}"; serial="${serial// /}"
+  # Guard: this host is the card-swap qualification bench - only ever touch a CMP 170HX (0x20C2).
+  case "${devid,,}" in
+    *20c2*) : ;;
+    *) echo "170hx-oc: skipping GPU $idx (device id $devid is not a 170HX)"; continue ;;
+  esac
+  nvidia-smi -i "$idx" -pl "$PL" >/dev/null 2>&1 \
+    || echo "170hx-oc: GPU $idx power limit $PL W REFUSED"
+  /usr/local/bin/nvml_oc "$OFFSET" 0 "$idx" >/dev/null 2>&1 \
+    || echo "170hx-oc: GPU $idx offset $OFFSET REFUSED"
+  if [ -n "$CLK" ]; then
+    nvidia-smi -i "$idx" -lgc "210,$CLK" >/dev/null 2>&1 \
+      || echo "170hx-oc: GPU $idx clock ceiling $CLK REFUSED"
+  else
+    nvidia-smi -i "$idx" -rgc >/dev/null 2>&1
+  fi
+  got=$(/usr/local/bin/nvml_oc 2>/dev/null | awk '/current offset/{print $NF=="MHz" ? $(NF-1) : $NF; exit}')
+  lim=$(nvidia-smi -i "$idx" --query-gpu=power.limit --format=csv,noheader 2>/dev/null)
+  echo "170hx-oc: GPU $idx ($serial) profile=$PROFILE offset=${got:-?} clk_max=${CLK:-unlocked} power_limit=${lim:-?}"
+  applied=$((applied + 1))
+done < <(nvidia-smi --query-gpu=index,pci.device_id,serial --format=csv,noheader 2>/dev/null)
+
+[ "$applied" -gt 0 ] || { echo "170hx-oc: no 170HX present - nothing applied"; exit 0; }

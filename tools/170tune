@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+# 170tune - measure, qualify and recover clock/voltage settings on a CMP 170HX.
+#
+# Named to match the shop's other tuning suites (arieltune, aputune, llmtune, biostune, memtune).
+#
+# Built because the failure that matters on this card is not a crash. An overclock can complete
+# every benchmark, throw no Xid, never hang, and silently return wrong bytes - intermittently.
+# So this tool separates "it ran" from "it is safe", records what it was doing before a hang, and
+# knows how to put the card back.
+#
+# Commands:
+#   explain                       what the levers are and how they fail
+#   status                        what the card is set to right now
+#   try     <off> <clk> [secs]    apply and measure one point (UNVERIFIED - proves nothing)
+#   gate    <off> <clk> [n]       run the full-VRAM pattern sweep n times (this is what proves it)
+#   ladder  <clk> [start] [step]  walk the offset up at one ceiling until it breaks, gating each step
+#   qualify [clk]                 full per-card flow, writes results/<serial>/oc.json
+#   apply   <profile> | reset     hand off to 170hx-oc
+#   selftest                      prove the harness still detects a known-bad point
+#   recover                       put the card back, escalating honestly if it is wedged
+#   boot-check                    (systemd) revert if the last run never checked in
+set -uo pipefail
+
+STATE=/var/lib/170tune
+# Paths must survive sudo, where $HOME becomes /root. Resolve against the INVOKING user's home.
+user_home() { getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6; }
+find_tool() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
+NVML=${NVML:-/usr/local/bin/nvml_oc}
+OCEFF=${OCEFF:-$(find_tool /usr/local/bin/oc_eff "$(user_home)/170hx/tools/oc_eff" "$HOME/170hx/tools/oc_eff")}
+BENCH=${BENCH:-$(find_tool /usr/local/bin/170hx-test.sh "$(user_home)/170hx/tools/170hx-test.sh" "$HOME/170hx/tools/170hx-test.sh")}
+COMPUTE=${COMPUTE:-$(find_tool /usr/local/bin/compute_check "$(user_home)/170hx/tools/compute_check" "$HOME/170hx/tools/compute_check")}
+OCAPPLY=${OCAPPLY:-/usr/local/bin/170hx-oc}
+MEASURE_TIMEOUT=${MEASURE_TIMEOUT:-180}
+GATE_TEMP=${GATE_TEMP:-60}      # soak until HBM reaches this many C - gate HOT, never cold
+GATE_SOAK_MAX=${GATE_SOAK_MAX:-180}  # give up soaking after this many seconds
+GATE_COMPUTE=${GATE_COMPUTE:-45} # seconds of bit-exact GEMM checking per gate
+SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-600}
+DEVID_170HX=20c2
+
+c_hi=$'\033[1m'; c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_bad=$'\033[31m'; c_off=$'\033[0m'
+[ -t 1 ] || { c_hi=""; c_ok=""; c_warn=""; c_bad=""; c_off=""; }
+say() { printf '%s\n' "$*"; }
+die() { printf '%s%s%s\n' "$c_bad" "$*" "$c_off" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"; }
+serial() { nvidia-smi --query-gpu=serial --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
+xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
+
+is_170hx() { case "$(devid)" in *$DEVID_170HX*) return 0 ;; *) return 1 ;; esac; }
+
+wedged() {
+    # a wedged GPU reports N/A for clocks and nvml_oc cannot read its offset
+    local c; c=$(nvidia-smi --query-gpu=clocks.sm --format=csv,noheader 2>&1 | head -1)
+    [[ "$c" == *"N/A"* || "$c" == *"Unable"* ]] && return 0
+    "$NVML" 2>&1 | grep -qi "requires reset" && return 0
+    return 1
+}
+
+# ---------------------------------------------------------------- armed marker
+# Written BEFORE a risky apply and cleared only after the run checks back in. If the box hangs,
+# the marker survives the reboot and boot-check reports what killed it instead of losing it.
+arm() {
+    mkdir -p "$STATE"
+    cat > "$STATE/armed.json" <<EOF
+{"offset": $1, "ceiling": $2, "serial": "$(serial)", "started": "$(date -Is)", "boot_id": "$(cat /proc/sys/kernel/random/boot_id)"}
+EOF
+    sync
+}
+disarm() { rm -f "$STATE/armed.json"; }
+
+# ---------------------------------------------------------------- apply / read
+apply_point() {
+    local off=$1 clk=$2
+    nvidia-smi -pm 1 >/dev/null 2>&1
+    nvidia-smi -pl 300 >/dev/null 2>&1
+    "$NVML" "$off" 0 >/dev/null 2>&1 || return 1
+    nvidia-smi -lgc "210,$clk" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# Drive the card under sustained load until it reaches a realistic operating temperature.
+# Soaking for a fixed DURATION is not good enough: how hot the card gets in 60 s depends on
+# ambient, on the profile, and on what ran before. Soak to a TEMPERATURE and report it.
+# Soak against HBM temperature, not core. The core reaches 52 C in seconds while the stacks are
+# still cold, and it is the MEMORY side that the pattern sweep is sensitive to: the run that first
+# caught +325/1400 had been driven to 59 C HBM. Targeting core temperature passed that same point.
+gpu_temp()  { nvidia-smi --query-gpu=temperature.memory --format=csv,noheader 2>/dev/null | tr -d ' '; }
+core_temp() { nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' '; }
+soak_to_temp() {
+    local target=${1:-$GATE_TEMP}
+    local maxsecs=${2:-$GATE_SOAK_MAX}
+    local end=$((SECONDS + maxsecs))
+    local t
+    t=$(gpu_temp)
+    while [ "${t:-0}" -lt "$target" ] 2>/dev/null; do
+        [ $SECONDS -ge $end ] && break
+        timeout 60 "$OCEFF" 8 >/dev/null 2>&1 || break
+        t=$(gpu_temp)
+    done
+    printf '%s' "${t:-0}"
+}
+
+cur_offset() { "$NVML" 2>/dev/null | awk '/current offset/{print $NF=="MHz"?$(NF-1):$NF; exit}'; }
+
+# ---------------------------------------------------------------- subcommands
+cmd_explain() {
+cat <<'EOF'
+THE TWO LEVERS
+
+  clock ceiling   nvidia-smi -lgc 210,<max>      picks the FREQUENCY the arbiter lands on
+  VF offset       nvmlDeviceSetGpcClkVfOffset    picks the VOLTAGE that frequency gets
+
+  You cannot set voltage directly on this SKU - there is no voltage API and no voltage
+  telemetry. The offset shifts the whole voltage/frequency curve, so a positive offset means
+  a given clock is reached at a LOWER voltage. Proven by holding the clock fixed and watching
+  watts: at a pinned 1350 MHz, offset +0 to +300 took 174.6 W down to 132.0 W with identical
+  throughput.
+
+  Power is an OUTCOME, not an input. A -pl cap also works but lets the clock oscillate around
+  the cap, which smears you across voltage points; pinning the clock holds one point and
+  measures better. The ceiling is set as 210,<max> so the card still idles down.
+
+TWO REGIMES
+
+  Below about 1350 the rail bottoms out: power goes flat and extra offset is inert.
+  Above about 1400 the data path runs out of voltage before the rail bottoms out.
+  So the safe offset is a function of the clock, and the best efficiency point sits at the
+  FLOOR of a lower ceiling rather than near the CLIFF of a higher one.
+
+THREE FAILURE MODES, IN ORDER OF NASTINESS
+
+  1. SILENT CORRUPTION - the run completes, no Xid, no hang, and memory comes back wrong.
+     Measured at +325/1400: sweeps gave 6 errors, 3 errors, 0 errors. This is why 'try' proves
+     nothing and only 'gate' can call a point safe.
+     AND IT IS TEMPERATURE DEPENDENT. That same point passed 4/4 sweeps on a cold card (37-43C)
+     and then returned mem_errors=4 after a soak to 51C core / 59C HBM. Hot silicon needs more
+     voltage, so an undervolt that is stable cold corrupts hot. 'gate' therefore soaks the card
+     before every sweep (GATE_SOAK seconds, default 60) and warns if it never got hot.
+  2. DEVICE FAULT - CUDA dies with illegal instruction / illegal memory access / cublas 14.
+     Recoverable with 'recover', usually needs a driver reload.
+  3. HANG - the GPU stops answering. Needs a reboot, sometimes a power cycle.
+
+  Work going DOWN while the clock goes UP is a fourth signature worth knowing: past the wall
+  the NAFLL stretches the clock instead of executing faster. +400/1650 reports a higher clock
+  than +375/1650 and delivers 4% less.
+
+HOW TO USE THIS TOOL
+
+  170tune try 300 1350        measure a point (fast, unverified)
+  170tune gate 300 1350 4     prove it with four full-VRAM pattern sweeps
+  170tune ladder 1350         find this card's safe ceiling at one clock
+  170tune qualify             the whole flow, recorded per serial
+  170tune recover             put it back after a fault
+EOF
+}
+
+cmd_status() {
+    is_170hx || say "${c_warn}warning: GPU 0 device id $(devid) is not a 170HX${c_off}"
+    if wedged; then
+        say "${c_bad}GPU IS WEDGED - run: 170tune recover${c_off}"
+    fi
+    printf 'serial      : %s\n' "$(serial)"
+    printf 'offset      : %s MHz\n' "$(cur_offset)"
+    nvidia-smi --query-gpu=clocks.max.sm,clocks.sm,clocks.mem,power.limit,power.draw,temperature.gpu,temperature.memory,memory.total \
+        --format=csv 2>/dev/null | sed 's/^/            /'
+    if [ -f "$STATE/armed.json" ]; then
+        say "${c_warn}armed marker present (a run is in flight or did not check in):${c_off}"
+        sed 's/^/            /' "$STATE/armed.json"
+    fi
+    [ -f "$STATE/last_crash.json" ] && { say "${c_bad}last crash record:${c_off}"; sed 's/^/            /' "$STATE/last_crash.json"; }
+    local s; s=$(serial)
+    [ -f "$STATE/results/$s/oc.json" ] && { say "qualified record:"; sed 's/^/            /' "$STATE/results/$s/oc.json"; }
+    return 0
+}
+
+# try: one measured point. Returns 0 clean, 1 fault, 2 hang.
+cmd_try() {
+    local off=${1:?offset} clk=${2:?ceiling} secs=${3:-10}
+    is_170hx || die "refusing: GPU 0 is not a 170HX (device id $(devid))"
+    wedged && die "GPU is wedged - run 'recover' first"
+    local x0; x0=$(xids)
+    arm "$off" "$clk"
+    apply_point "$off" "$clk" || { disarm; die "could not apply offset=$off ceiling=$clk"; }
+    local out rc
+    out=$(timeout "$MEASURE_TIMEOUT" "$OCEFF" "$secs" 2>&1); rc=$?
+    local x1; x1=$(xids)
+    disarm
+    if [ $rc -eq 124 ]; then
+        say "${c_bad}HANG at offset=+$off ceiling=$clk - the measurement never returned${c_off}"
+        say "  recover with: 170tune recover   (this class usually needs a reboot)"
+        return 2
+    fi
+    if [ $rc -ne 0 ] || [ "$x1" -gt "$x0" ]; then
+        say "${c_bad}FAULT at offset=+$off ceiling=$clk${c_off}  $(echo "$out" | tail -1)"
+        return 1
+    fi
+    printf '%s\n' "$out" | sed 's/^offset=/  offset=/'
+    say "${c_warn}  UNVERIFIED: this only means the run completed. Silent corruption looks exactly"
+    say "  like this. Prove it with: 170tune gate $off $clk 4${c_off}"
+    return 0
+}
+
+# gate: the only thing that can call a point safe.
+cmd_gate() {
+    local off=${1:?offset} clk=${2:?ceiling} n=${3:-4}
+    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    [ -x "$BENCH" ] || die "integrity gate not found at $BENCH (set BENCH=...)"
+    apply_point "$off" "$clk" || die "could not apply offset=$off ceiling=$clk"
+    say "gating offset=+$off ceiling=$clk: $n pattern sweeps + ${GATE_COMPUTE}s compute check, each soaked to ${GATE_TEMP}C HBM"
+    local fails=0 i res errs tmax=0 t
+    for i in $(seq 1 "$n"); do
+        arm "$off" "$clk"
+        # SOAK FIRST. This matters: the same point passed 4/4 sweeps cold (37-43C) and returned
+        # mem_errors=4 once the card had been driven to 51C core / 59C HBM. Hot silicon needs more
+        # voltage, so an undervolt that is stable cold corrupts hot. A gate that runs cold lies.
+        t=$(soak_to_temp)
+        [ "${t:-0}" -gt "$tmax" ] 2>/dev/null && tmax=$t
+        res=$(timeout "$SWEEP_TIMEOUT" "$BENCH" --no-unlock 2>&1 | grep -oE "mem_errors=[0-9]+ +compute_ok=[0-9]+" | head -1)
+        disarm
+        errs=$(printf '%s' "$res" | grep -oE "mem_errors=[0-9]+" | cut -d= -f2)
+        if [ -z "$res" ]; then
+            say "  sweep $i: ${c_bad}did not complete${c_off}"; fails=$((fails+1)); continue
+        fi
+        if [ "${errs:-1}" -ne 0 ]; then
+            say "  sweep $i: ${c_bad}$res  <- CORRUPTION${c_off}  (HBM ${t}C / core $(core_temp)C)"; fails=$((fails+1))
+        else
+            say "  sweep $i: ${c_ok}$res${c_off}  (HBM ${t}C / core $(core_temp)C)"
+        fi
+    done
+    # The pattern sweep proves memory. It says nothing about the SM pipeline, where an undervolt
+    # can produce wrong arithmetic with memory perfectly clean. Check that separately, while hot.
+    if [ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ]; then
+        soak_to_temp >/dev/null
+        arm "$off" "$clk"
+        local cout crc
+        cout=$(timeout $((GATE_COMPUTE + 120)) "$COMPUTE" "$GATE_COMPUTE" 2>&1); crc=$?
+        disarm
+        if [ $crc -eq 0 ]; then
+            say "  compute: ${c_ok}$(printf '%s' "$cout" | tail -2 | head -1)${c_off}"
+        else
+            say "  compute: ${c_bad}$(printf '%s' "$cout" | tail -2 | tr '\n' ' ')${c_off}"
+            fails=$((fails+1))
+        fi
+    else
+        say "  ${c_warn}compute check skipped (compute_check not found) - memory-only gate${c_off}"
+    fi
+    if [ "$fails" -eq 0 ]; then
+        say "${c_ok}GATED: offset=+$off ceiling=$clk passed $n/$n sweeps + compute (peak HBM ${tmax}C)${c_off}"
+        [ "${tmax:-0}" -lt "$GATE_TEMP" ] 2>/dev/null && say "${c_warn}  CAUTION: HBM never reached ${GATE_TEMP}C (peaked ${tmax}C). Optimistic - raise GATE_SOAK_MAX.${c_off}"
+        return 0
+    fi
+    say "${c_bad}REJECTED: $fails/$n sweeps failed. Do not ship this point.${c_off}"
+    return 1
+}
+
+# ladder: raise the offset at one ceiling until it breaks, gating as it goes.
+cmd_ladder() {
+    local clk=${1:?ceiling} start=${2:-200} step=${3:-50} maxoff=${4:-450}
+    local off=$start last_good=""
+    say "ladder at ceiling $clk, offsets $start..$maxoff step $step (gate = 2 sweeps per rung)"
+    while [ "$off" -le "$maxoff" ]; do
+        cmd_try "$off" "$clk" 10; local rc=$?
+        if [ $rc -ne 0 ]; then
+            say "  stopped: +$off did not survive the measurement"
+            break
+        fi
+        if cmd_gate "$off" "$clk" 2 >/dev/null 2>&1; then
+            say "  ${c_ok}+$off gated clean${c_off}"; last_good=$off
+        else
+            say "  ${c_bad}+$off completed but FAILED the integrity gate - this is the cliff${c_off}"
+            break
+        fi
+        off=$((off + step))
+    done
+    if [ -n "$last_good" ]; then
+        say "${c_ok}highest gated offset at ceiling $clk: +$last_good${c_off}"
+        say "ship one step BELOW the cliff, not at it - see 'explain'"
+    else
+        say "${c_bad}nothing gated clean at ceiling $clk${c_off}"
+    fi
+    printf '%s' "$last_good"
+}
+
+cmd_qualify() {
+    local clk=${1:-1350}
+    local s; s=$(serial); [ -n "$s" ] || die "no serial - is a card installed?"
+    mkdir -p "$STATE/results/$s"
+    say "${c_hi}qualifying card $s at ceiling $clk${c_off}"
+    say "-- baseline (stock)"
+    "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
+    local base; base=$(timeout "$MEASURE_TIMEOUT" "$OCEFF" 10 2>&1 | tail -1); say "   $base"
+    say "-- offset ladder"
+    local best; best=$(cmd_ladder "$clk" 200 50 450 | tail -1)
+    local ship=""
+    if [ -n "$best" ]; then
+        ship=$((best - 50))
+        say "-- confirming the ship point (+$ship, one step below the highest gated) with 4 sweeps"
+        cmd_gate "$ship" "$clk" 4 || { say "${c_bad}ship point failed - dropping another step${c_off}"; ship=$((ship-50)); cmd_gate "$ship" "$clk" 4 || ship=""; }
+    fi
+    local final; final=$(timeout "$MEASURE_TIMEOUT" "$OCEFF" 10 2>&1 | tail -1)
+    cat > "$STATE/results/$s/oc.json" <<EOF
+{
+  "serial": "$s",
+  "qualified": "$(date -Is)",
+  "ceiling": $clk,
+  "highest_gated_offset": ${best:-null},
+  "recommended_offset": ${ship:-null},
+  "baseline": "$(printf '%s' "$base" | tr -d '"')",
+  "at_recommended": "$(printf '%s' "$final" | tr -d '"')",
+  "gate": "full-VRAM pattern sweep, 4x at the recommended point"
+}
+EOF
+    say "${c_ok}recorded: $STATE/results/$s/oc.json${c_off}"
+    say "nothing was made persistent - to adopt it: 170hx-oc <profile>, or edit 170hx-oc.service"
+}
+
+# selftest - a PASS from this harness only means something if the harness can still detect a
+# failure. This checks the DETECTOR PLUMBING deterministically (fault path, corruption parser,
+# temperature soak), because the physical positive control is not reproducible on demand: the
+# +325/1400 corruption events are real but intermittent, and the same point has since passed
+# repeated gates at 60 C HBM. Use --physical to additionally run that point and report what
+# happens, but a clean result there is NOT evidence the harness is broken.
+cmd_selftest() {
+    local physical=0
+    [ "${1:-}" = "--physical" ] && { physical=1; shift; }
+    local rc=0
+
+    say "${c_hi}== 1. corruption parser: a sweep reporting errors must be rejected${c_off}"
+    local probe; probe=$(mktemp)
+    cat > "$probe" <<'FAKE'
+#!/usr/bin/env bash
+echo "    swept 64110 MiB  mem_errors=7  compute_ok=1  bw(h2d)=1.71  hbm_triad=1600.00 GB/s"
+FAKE
+    chmod +x "$probe"
+    if BENCH="$probe" GATE_COMPUTE=0 GATE_SOAK_MAX=0 cmd_gate "${GOOD_OFF:-300}" "${GOOD_CLK:-1350}" 1 >/dev/null 2>&1; then
+        say "${c_bad}  FAIL: a sweep reporting mem_errors=7 was accepted. The parser is broken.${c_off}"; rc=1
+    else
+        say "${c_ok}  ok - mem_errors=7 was caught and rejected${c_off}"
+    fi
+
+    say "${c_hi}== 2. incomplete sweep must be treated as a failure, not a pass${c_off}"
+    cat > "$probe" <<'FAKE'
+#!/usr/bin/env bash
+echo "some unrelated output with no result line"
+FAKE
+    chmod +x "$probe"
+    if BENCH="$probe" GATE_COMPUTE=0 GATE_SOAK_MAX=0 cmd_gate "${GOOD_OFF:-300}" "${GOOD_CLK:-1350}" 1 >/dev/null 2>&1; then
+        say "${c_bad}  FAIL: a sweep that produced no result line was accepted.${c_off}"; rc=1
+    else
+        say "${c_ok}  ok - a sweep with no result line counts as a failure${c_off}"
+    fi
+
+    say "${c_hi}== 3. compute checker is present and returns clean on a known-good point${c_off}"
+    if [ ! -x "$COMPUTE" ]; then
+        say "${c_bad}  FAIL: compute_check not found at $COMPUTE - the gate would be memory-only${c_off}"; rc=1
+    else
+        apply_point "${GOOD_OFF:-300}" "${GOOD_CLK:-1350}" || true
+        if timeout 200 "$COMPUTE" 15 >/dev/null 2>&1; then say "${c_ok}  ok - compute checker runs clean${c_off}"
+        else say "${c_bad}  FAIL: compute checker reported corruption at a known-good point${c_off}"; rc=1; fi
+    fi
+
+    say "${c_hi}== 4. thermal soak actually heats the card${c_off}"
+    local t0 t1
+    t0=$(gpu_temp); t1=$(GATE_TEMP=${GATE_TEMP} soak_to_temp)
+    if [ "${t1:-0}" -ge "$GATE_TEMP" ] 2>/dev/null; then
+        say "${c_ok}  ok - HBM reached ${t1}C (target ${GATE_TEMP}C, started ${t0}C)${c_off}"
+    else
+        say "${c_warn}  WARN: HBM only reached ${t1}C in ${GATE_SOAK_MAX}s (target ${GATE_TEMP}C). Gates will be"
+        say "  optimistic on this box - raise GATE_SOAK_MAX or check cooling.${c_off}"
+    fi
+
+    if [ "$physical" = "1" ]; then
+        say "${c_hi}== 5. physical control: +325/1400 has produced silent corruption before${c_off}"
+        say "  NOTE: intermittent. A clean result here does not clear the point and does not"
+        say "  indict the harness. It is reported, not asserted."
+        cmd_gate 325 1400 2 && say "${c_warn}  the known-bad point came back clean this run${c_off}" \
+                            || say "${c_ok}  the known-bad point was caught this run${c_off}"
+    fi
+
+    rm -f "$probe"
+    if [ $rc -eq 0 ]; then say "${c_ok}SELFTEST PASSED - the detectors work${c_off}"; else say "${c_bad}SELFTEST FAILED - do not trust a PASS from this harness${c_off}"; fi
+    return $rc
+}
+
+cmd_recover() {
+    need_root "$@"
+    say "-- clearing offsets and clock locks"
+    "$NVML" 0 0 >/dev/null 2>&1 && say "   offset reset to 0" || say "   ${c_warn}offset reset REFUSED (card may be wedged)${c_off}"
+    nvidia-smi -rgc >/dev/null 2>&1 && say "   clock lock cleared"
+    nvidia-smi -pl 250 >/dev/null 2>&1 && say "   power limit back to 250 W"
+    disarm
+    if ! wedged; then
+        say "${c_ok}card responds - recovered${c_off}"; nvidia-smi --query-gpu=clocks.sm,memory.total --format=csv,noheader
+        return 0
+    fi
+    say "${c_warn}card still wedged - trying a driver reload${c_off}"
+    systemctl stop nvidia-persistenced gpu-fan-curve 2>/dev/null
+    fuser -k /dev/nvidia* 2>/dev/null
+    modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>&1 | head -2
+    modprobe nvidia 2>&1 | head -2
+    systemctl start nvidia-persistenced gpu-fan-curve 2>/dev/null
+    sleep 3
+    if ! wedged; then say "${c_ok}driver reload recovered it${c_off}"; return 0; fi
+    say "${c_bad}still wedged after a driver reload."
+    say "  next step: reboot. If it is still wedged after a reboot, it needs a real power cycle"
+    say "  (a warm reboot leaves the card powered). That is hands-on-the-box work.${c_off}"
+    return 1
+}
+
+# boot-check: run once at boot. If a marker survived, the last thing we tried killed the box.
+cmd_boot_check() {
+    need_root "$@"
+    [ -f "$STATE/armed.json" ] || exit 0
+    local this_boot; this_boot=$(cat /proc/sys/kernel/random/boot_id)
+    local armed_boot; armed_boot=$(grep -oE '"boot_id": "[^"]+"' "$STATE/armed.json" | cut -d'"' -f4)
+    if [ "$this_boot" = "$armed_boot" ]; then exit 0; fi     # same boot, still in flight
+    mkdir -p "$STATE"
+    { echo "{\"detected\": \"$(date -Is)\", \"note\": \"this setting was in flight when the machine went down\", \"armed\":"; cat "$STATE/armed.json"; echo "}"; } > "$STATE/last_crash.json"
+    disarm
+    "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
+    logger -t 170tune "reverted to stock: a tuning run did not check in before the machine went down (see $STATE/last_crash.json)"
+    say "reverted to stock. The run that did not check in is recorded in $STATE/last_crash.json"
+}
+
+cmd_help() {
+cat <<'EOF'
+170tune - measure, qualify and recover clock/voltage settings on a CMP 170HX
+
+USAGE
+  170tune <command> [args]
+
+COMMANDS
+  explain                     the levers, the two regimes, and the failure modes. Start here.
+  status                      what the card is set to now, plus any armed marker or crash record.
+  try     <off> <clk> [secs]  apply one point and measure it. Prints UNVERIFIED: completing a
+                              benchmark is exactly what silent corruption looks like.
+  gate    <off> <clk> [n]     the proof. Soaks the card to GATE_TEMP, then runs n full-VRAM
+                              pattern sweeps plus a bit-exact compute check. Only this can call
+                              a point safe. Exit 0 = gated, 1 = rejected.
+  ladder  <clk> [start] [step] [max]
+                              walk the offset up at one ceiling, gating each rung, and stop at
+                              the first rung that runs but fails the gate. Prints the highest
+                              gated offset. Ship BELOW it, not at it.
+  qualify [clk]               the whole per-card flow, recorded to
+                              /var/lib/170tune/results/<serial>/oc.json. Changes nothing
+                              permanently - adopting a result is a separate, deliberate step.
+  selftest [--physical]       prove the detectors still work before trusting any PASS.
+  apply   <profile>           make a profile live NOW (see PROFILES). Not persistent by itself.
+  reset                       back to stock: offset 0, no clock lock, 250 W.
+  recover                     after a fault or hang: clear offsets and locks, reload the driver
+                              if the card is wedged, and escalate honestly to reboot or power
+                              cycle if that does not work.
+  boot-check                  systemd oneshot. If a tuning run did not check in before the
+                              machine went down, revert to stock and record what was in flight.
+
+PROFILES (applied by 170hx-oc, which 'apply' calls)
+  stock     +0   / no lock    184.3 TF @ 199.2 W    baseline
+  dense     +250 / 1200       160.8 TF @ 120.2 W    most cards per PSU
+  eff       +300 / 1350       180.8 TF @ 131.2 W    default: near-stock speed, a third less power
+  match     +250 / 1400       186.5 TF @ 142.2 W    exactly stock throughput, much less power
+  balanced  +300 / 1470       196.2 TF @ 149.7 W    more throughput, still under 150 W
+  perf      +350 / 1590       212.2 TF @ 181.2 W    throughput first, still under stock power
+  max       +350 / 1650       215.3 TF @ 186.1 W    peak validated throughput
+
+  'apply' changes the running card only. To make a profile survive a reboot, edit ExecStart in
+  /etc/systemd/system/170hx-oc.service - deliberately a manual step, so a good measurement can
+  never promote itself into production by accident.
+
+ENVIRONMENT
+  GATE_TEMP=60          HBM temperature to soak to before every sweep. Gating a cold card is
+                        the classic way to bless a setting that fails in service.
+  GATE_SOAK_MAX=180     give up soaking after this long
+  GATE_COMPUTE=45       seconds of bit-exact GEMM checking per gate (0 disables)
+  MEASURE_TIMEOUT=180   a measurement that exceeds this is treated as a HANG
+  BENCH=/path           the full-VRAM integrity sweep (default: the 170hx-test.sh on this box)
+  COMPUTE=/path         the compute checker
+  NVML=/path            nvml_oc
+
+EXIT CODES
+  0 success / gated       1 rejected, faulted, or failed       2 usage error or hang
+
+TYPICAL SESSION
+  170tune explain
+  170tune selftest
+  170tune ladder 1350
+  170tune gate 300 1350 4
+  170tune apply eff
+EOF
+}
+
+case "${1:-}" in
+    -h|--help|help) cmd_help ;;
+    explain)    cmd_explain ;;
+    status)     cmd_status ;;
+    try)        shift; need_root try "$@"; cmd_try "$@" ;;
+    gate)       shift; need_root gate "$@"; cmd_gate "$@" ;;
+    ladder)     shift; need_root ladder "$@"; cmd_ladder "$@" ;;
+    qualify)    shift; need_root qualify "$@"; cmd_qualify "$@" ;;
+    apply)      shift; exec "$OCAPPLY" "${1:?profile}" ;;
+    reset)      exec "$OCAPPLY" stock ;;
+    selftest)   shift; need_root selftest "$@"; cmd_selftest "$@" ;;
+    recover)    shift; cmd_recover "$@" ;;
+    boot-check) shift; cmd_boot_check "$@" ;;
+    *) cmd_help; exit 2 ;;
+esac
