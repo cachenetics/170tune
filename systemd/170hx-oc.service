@@ -1,6 +1,6 @@
 [Unit]
 Description=CMP 170HX clock-offset + power-limit profile (efficiency point)
-Documentation=https://192.168.1.186/root/cmp170hx-unlock/-/blob/main/analysis/oc_efficiency_2026-07-27.md
+Documentation=file:///usr/share/doc/170tune/tuning-guide.md
 After=nvidia-persistenced.service gen2-hammer.service
 Wants=nvidia-persistenced.service
 ConditionPathExists=/usr/local/bin/nvml_oc
