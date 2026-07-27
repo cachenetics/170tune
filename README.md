@@ -274,6 +274,53 @@ here.
 
 ## Attribution
 
+Almost everything this tool stands on was worked out by other people, in this order.
+
+**[amoghmunikote/cmpunlocker](https://github.com/amoghmunikote/cmpunlocker)** is the
+foundation. The 64 GB memory unlock is his: a runtime unlock through patched open GPU
+kernel modules, no VBIOS flash. Without it this card exposes 8 GB and none of the rest
+of this matters. His Gen2 patch (`0007`) is also what makes the endpoint advertise
+`CAP2=0x06` at all, which is the opening every later attempt aims at.
+
+**bendy2** worked out the PCIe Gen2 retrain: target speed in LNKCTL2 on both the
+endpoint and the upstream bridge, Retrain Link bit, then poll LnkSta and only claim
+success on a genuinely negotiated Gen2. He also moved it into the driver via `ioremap`
+of BAR0, which fixed the mmap failure that had blocked userspace attempts. Merged
+upstream as PR #18.
+
+**[asm64-hooligan/cmpunlocker@mem_overclock](https://github.com/asm64-hooligan/cmpunlocker/tree/mem_overclock)**
+mapped the FBPA memory PLL, in a fork of amogh's repo: the per-partition register
+locations (cfg at `+0x3C90`, coefficient at `+0x3C98`, base `0x900000 + i*0x4000`), the
+coefficient encoding, and the `FBPA_PLL` priv-level-mask entry `0x009a3c7c` that opens
+in the post-BooterLoad window. The memory-clock section of the guide is built on that
+map, and finding it independently would have cost weeks.
+
+Our measurements disagree with that fork's conclusion: raising the memory PLL does not
+raise delivered bandwidth on this part, because the DRAM runs at the rate it was
+trained at and the stacks already ship at 3.456 Gbps per pin, above HBM2e nominal. That
+is a disagreement about what the lever buys, not about the register work, which is
+sound. Running the same lever downward is what proved the PLL genuinely reaches the
+DRAM, and it is a usable power saving in its own right.
+
+**This project** contributes what sits on top of all of that: the tuning, the
+measurement discipline, the integrity gate and the recovery path. The link-training
+half of our work lives separately in
+[cmp170hx-gen2](https://github.com/studebaker8/cmp170hx-gen2), which is bendy2's
+sequence fired at the one moment it works.
+
+If you take one idea from this repo, take the gate rule: on this card, "it did not
+crash" is not a result.
+
+## License
+
+MIT, see LICENSE. Note what that does and does not cover: this repo is the tuning,
+measurement and recovery harness. The 64 GB memory unlock and the PCIe Gen2 retrain it
+assumes are separate projects with their own licenses, and none of their code is included
+here.
+
+
+## Attribution
+
 The hard parts belong to other projects.
 
 The 64 GB memory unlock is amoghmunikote/cmpunlocker: a runtime unlock via patched
