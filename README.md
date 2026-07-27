@@ -267,6 +267,14 @@ docs/170hx-tuning-guide.md   the long-form findings
 analysis/oc_matrix.md        the full offset x clock-ceiling measurement matrix
 ```
 
+## License
+
+MIT, see LICENSE. Note what that does and does not cover: this repo is the tuning,
+measurement and recovery harness. The 64 GB memory unlock and the PCIe Gen2 retrain it
+assumes are separate projects with their own licenses, and none of their code is included
+here.
+
+
 ## Attribution
 
 The hard parts belong to other projects. The 64 GB memory unlock is
