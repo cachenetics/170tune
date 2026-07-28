@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# 170hx-soak - run a workload over and over at the current profile and fail loudly the moment the
+# card misbehaves. The gate is a filter; this is what decides whether a point can be shipped.
+#
+# WHY THIS EXISTS. On the reference card +300/1350 passed the full 4-sweep hot gate, ~55,000
+# bit-exact GEMMs AND a production-engine workload rung, then faulted with Xid 13 (Illegal
+# Instruction Encoding) in the FIRST round of an hour-long soak. A gate answers "does it work"; only
+# a soak answers "does it keep working". Nothing shorter found this fault.
+#
+# usage:  170hx-soak <rounds> <command...>
+#   e.g.  sudo 170hx-soak 12 /usr/local/bin/my_workload.sh
+#
+# Each round runs your command. The command must exit 0 on success. Between rounds this checks the
+# kernel ring for NEW Xid lines, which is the signal that survives a workload that silently retried.
+#
+# exit: 0 = every round clean, 1 = a round failed or an Xid appeared, 2 = usage/permission problem.
+set -uo pipefail
+
+ROUNDS=${1:-}
+shift 2>/dev/null || true
+[ -z "${ROUNDS:-}" ] || [ $# -eq 0 ] && { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+case "$ROUNDS" in ''|*[!0-9]*) echo "170hx-soak: rounds must be a number"; exit 2 ;; esac
+
+# The Xid guard MUST be able to read the ring buffer. Under kernel.dmesg_restrict=1 an unprivileged
+# dmesg returns EMPTY and exits 0, so a guard written without this check reports "0 Xid" forever -
+# including through 29 real Xid lines, measured. A guard that cannot fail is worse than no guard.
+xid_count() { dmesg 2>/dev/null | grep -c Xid; }
+probe=$(dmesg 2>&1 >/dev/null)
+if [ -n "$probe" ] || { [ "$(id -u)" != "0" ] && [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = "1" ]; }; then
+    echo "170hx-soak: cannot read the kernel ring buffer, so the Xid guard would be blind."
+    echo "            re-run with sudo, or set kernel.dmesg_restrict=0."
+    exit 2
+fi
+
+base=$(xid_count)
+echo "170hx-soak: $ROUNDS rounds, Xid baseline $base"
+[ -x /usr/local/bin/170tune ] && /usr/local/bin/170tune status 2>/dev/null \
+    | grep -E "^(serial|offset|ceiling|profile|power)" | head -5
+
+start=$SECONDS
+for r in $(seq 1 "$ROUNDS"); do
+    "$@" > "/tmp/170hx-soak.$r.log" 2>&1
+    rc=$?
+    now=$(xid_count)
+    temps=$(nvidia-smi --query-gpu=power.draw,temperature.gpu,temperature.memory \
+            --format=csv,noheader,nounits 2>/dev/null)
+    printf "round %2s/%s  rc=%s  xid_delta=%s  [%s]  %s\n" \
+           "$r" "$ROUNDS" "$rc" "$((now - base))" "$temps" "$(date -u +%H:%M:%S)"
+    if [ "$rc" != "0" ] || [ "$now" != "$base" ]; then
+        echo "170hx-soak: FAILED at round $r after $(( (SECONDS - start) / 60 )) min"
+        [ "$now" != "$base" ] && dmesg | grep Xid | tail -4
+        echo "170hx-soak: quarantine this point:"
+        echo "  170tune quarantine <off> <clk> --reason \"...\""
+        exit 1
+    fi
+done
+echo "170hx-soak: CLEAN - $ROUNDS rounds over $(( (SECONDS - start) / 60 )) min, 0 Xid, 0 failures"

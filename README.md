@@ -9,25 +9,33 @@ passes, and the data is wrong. 170tune separates "it ran" from "it is safe".
 
 What tuning buys, on the reference card (serial 1322621047793):
 
-* Dense GEMM bench: near-stock throughput at about a third less power (`eff`: 180.8
-  TFLOPS at 131.2 W, vs stock 184.3 TFLOPS at 199.2 W).
-* Real inference serving: about +5% throughput (`match`). The two benchmarks rank the
-  profiles differently, and three profiles that pass the GEMM gate kill a server; read
-  [Profiles](#profiles) before choosing.
+* Dense GEMM bench: near-stock throughput at about a third less power (`match`: 186.5
+  TFLOPS at 142.2 W, vs stock 184.3 TFLOPS at 199.2 W).
+* Real inference serving: about +5% throughput, and 342 tok/s decode at +200/1400.
+
+The two benchmarks rank the profiles differently, and **four** profiles that pass the GEMM
+gate go on to kill a real server - one of them only after an hour of clean serving. Read
+[Profiles](#profiles) before choosing, and soak whatever you choose.
 
 ## Quick start
 
 ```
-./install.sh                    # build the probes, install, enable boot-check. Overclocks nothing.
-sudo 170tune selftest           # prove the corruption detectors work before trusting any PASS
-sudo 170tune gate 300 1350 4    # 4 temperature-soaked full-VRAM sweeps + bit-exact compute check
-sudo 170tune persist eff        # exit 0 above = gated; apply +300/1350 now and at every boot
+./install.sh                       # build the probes, install, enable boot-check. Overclocks nothing.
+sudo 170tune selftest              # prove the corruption detectors work before trusting any PASS
+sudo 170tune gate 200 1400 4 --workload /usr/local/bin/vllm_workload_check.sh
+sudo 170hx-soak 12 /usr/local/bin/vllm_workload_check.sh    # the step that actually decides
+sudo 170tune persist custom 200 1400
 ```
 
-That gates and ships the `eff` profile. Its numbers come from one card and silicon
-varies, so on yours prefer the per-card flow: `170tune explain`, `sudo 170tune ladder
-1350` to find your safe offset, `sudo 170tune qualify`, then `sudo 170tune persist
-custom <off> <clk>` to adopt what it recommended. `qualify` records to
+That gates, soaks and ships `+200/1400`, the point that has held on the reference card
+across two hour-long soaks. **Do not skip the soak line.** On this card `+300/1350` passed
+the gate *including* the workload rung and then faulted in the first round of the soak; see
+[Even a workload rung is not enough](#even-a-workload-rung-is-not-enough-soak-before-you-ship).
+
+Those numbers come from one card and silicon varies, so on yours prefer the per-card flow:
+`170tune explain`, `sudo 170tune ladder 1400` to find your safe offset, `sudo 170tune
+qualify`, then `sudo 170tune persist custom <off> <clk>` to adopt what it recommended, and
+soak it before you believe it. `qualify` records to
 `/var/lib/170tune/results/<serial>/oc.json` and changes nothing permanently: a
 measurement can never promote itself into production by accident, adopting one is a
 separate, deliberate verb.
@@ -96,17 +104,33 @@ Dense GEMM bench (sustained bf16 tensor-core GEMM, NVML power sampled in-process
 profile   offset  clk max   bf16 TFLOPS   watts     GFLOPS/W   note
 stock       +0    (none)       184.3      199.2 W      925     baseline
 dense      +250    1200        160.8      120.2 W     1337     lowest draw, most cards per PSU
-eff        +300    1350        180.8      131.2 W     1378     near-stock speed, a third less power
+eff        +300    1350        180.8      131.2 W     1378     QUARANTINED on the reference card
 match      +250    1400        186.5      142.2 W     1311     stock throughput, -29% power
 balanced   +300    1470        196.2      149.7 W     1311     QUARANTINED on the reference card
 perf       +350    1590        212.2      181.2 W     1171     QUARANTINED on the reference card
 max        +350    1650        215.3      186.1 W     1157     QUARANTINED on the reference card
 ```
 
-One number to be careful with: `eff` ships at +300/1350, re-gated hot (3/3 clean sweeps
-at 51-52 C HBM). Earlier drafts of the measurement notes named +250/1350; both sit on the
-flat part of the voltage floor and draw within a watt of each other, so the difference is
-margin, not performance. The applier and this README are authoritative.
+**`eff` is no longer safe to ship on the reference card, and the GFLOPS/W column is why it
+took so long to find out.** +300/1350 is the most efficient row in this table, gated hot
+3/3 and then 4/4, passed a workload rung, served every benchmark in these notes for a full
+day, and then faulted with Xid 13 in the first round of an hour-long soak. It is
+quarantined here. `+300` has now faulted at 1650, 1400 and 1350; on this card the offset,
+not the ceiling, is the risk lever.
+
+Two soak-qualified replacements, each clean over a 12-round soak (1,800 multi-step
+generations and 480 long-context retrievals, 0 Xid, 0 request errors):
+
+```
+point       offset  clk max   cap     serving decode   power    note
++200/1400    +200    1400     300 W     342 tok/s      181 W    highest stable throughput
++200/1200    +200    1200     200 W     303 tok/s      149 W    89% of the speed, 82% of the power
+```
+
+The second exists for cards sharing a room with people: it removes about 64 W of continuous
+room heat per pair. Note what it does NOT do - temperature and fan speed barely move across
+the whole cap range, because the fan curve is a thermostat. A power cap buys room heat, not
+quiet.
 
 ### What the table is worth under a real server
 
@@ -124,6 +148,11 @@ balanced   -         -        -         killed the server mid-inference
 perf       -         -        -         never got that far: dies at CUDA graph capture
 max        -         -        -         killed the server mid-inference
 ```
+
+`eff` looks fine here and is not. This table is a three-minute benchmark; +300/1350 went on
+to serve a full day of them before faulting with Xid 13 under an hour-long soak of longer
+prompts and longer generations. A serving benchmark is a better probe than a GEMM, and it
+is still not a soak.
 
 Be precise about what was captured. Only `perf` has a verbatim signature, at graph
 capture during server startup:
@@ -268,6 +297,44 @@ failed within thirty seconds, so a short run does discriminate, but a point that
 three minutes of serving has been shown to survive three minutes of serving and nothing
 more. If it is going to run for days, gate it for longer than a benchmark takes.
 
+### Even a workload rung is not enough: soak before you ship
+
+On the reference card `+300/1350` passed the full 4-sweep hot gate, ~55,000 bit-exact
+GEMMs **and** a production-engine workload rung, was persisted on the strength of that,
+and then faulted with Xid 13 (Illegal Instruction Encoding, GPC 3) in the **first round**
+of an hour-long soak. A sibling point, `+300/1400`, had passed the same gate plus a
+232-request throughput sweep, a 31-minute 3,552-request burn-in and a hand-checked chat
+completion before it faulted the same way. Nothing shorter than a soak found either one.
+
+```
+170hx-soak 12 /usr/local/bin/my_workload.sh      # run it 12 times, fail on any Xid
+```
+
+`170hx-soak` repeats your workload and checks the kernel ring for new Xid lines between
+rounds. That second check matters independently: an engine that retries, or a client with
+a generous timeout, can absorb a fault that the card is reporting plainly to dmesg.
+
+Two dimensions decide whether a soak discriminates:
+
+* **Duration.** The two profiles above needed tens of minutes of continuous serving.
+* **Instruction mix.** The fault appeared under long prompts and long multi-step
+  generations, not under the short-prompt benchmark that the throughput sweeps and the
+  burn-in used. Same engine, same port, different code paths through it. If your service
+  will see long contexts, soak it with long contexts.
+
+One trap, because it silently disarms the whole thing: **run the Xid guard as root.**
+Under `kernel.dmesg_restrict=1` an unprivileged `dmesg` returns nothing and exits 0, so a
+guard reads "0 Xid" indefinitely. That happened here, and the soak reported `xid_delta=0`
+through 29 real Xid lines; only the request-error count caught the failure. `170hx-soak`
+refuses to start rather than run blind.
+
+Finally, on this card the OFFSET is the risk lever, not the ceiling. `+300` faulted at
+1650, at 1400 and at 1350; `+200` has held at every ceiling asked of it, across two
+hour-long soaks. The offset is an undervolt, so a larger one means less voltage margin at
+every frequency, and instruction decode is what fails first - before memory, before
+arithmetic, and therefore before anything the pattern sweeps or the GEMM check can see.
+If a point faults, lower the offset before you lower the ceiling.
+
 A fourth signature worth knowing: past the wall the clock stretcher engages and the card
 runs SLOWER while reporting a higher clock (+400/1650 reports a higher clock than
 +375/1650 and delivers 4% less). Running slower there is the hardware protecting itself,
@@ -402,6 +469,8 @@ tools/gpu_selftest.cu   full-VRAM sweep: unique-per-address 64-bit pattern verif
 tools/ctx_probe.cu      the smallest proof the card is USABLE: create a context, allocate,
                         launch, read back. Catches the wedge nvidia-smi cannot see
 tools/vllm_workload_check.sh  worked 'gate --workload' rung against a real vLLM service
+tools/170hx-soak        repeat a workload for hours and fail on any new Xid; what decides
+                        whether a gated point can actually be shipped
 tools/oc_eff.cu         sustained bf16 GEMM with in-process NVML power sampling
 tools/mem_probe.cu      streaming bandwidth + dependent-load latency probes
 docs/tuning-guide.md         the long-form findings
