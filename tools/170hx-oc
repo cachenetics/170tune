@@ -83,6 +83,11 @@ command -v nvidia-smi >/dev/null || { echo "nvidia-smi missing"; exit 1; }
 
 nvidia-smi -pm 1 >/dev/null 2>&1
 
+# how many 170HX cards are present? more than one + no recorded serial = refuse, do not guess.
+ngpu=$(nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null \
+        | grep -ic "20c2" || true)
+multi=0; [ "${ngpu:-0}" -gt 1 ] && multi=1
+
 applied=0
 while IFS=, read -r idx devid serial; do
   idx="${idx// /}"; devid="${devid// /}"; serial="${serial// /}"
@@ -91,6 +96,21 @@ while IFS=, read -r idx devid serial; do
     *20c2*) : ;;
     *) echo "170hx-oc: skipping GPU $idx (device id $devid is not a 170HX)"; continue ;;
   esac
+  # Guard: QUALIFICATION IS PER-CARD. A gate receipt is written per serial and a point that soaks
+  # clean on one card says nothing about another - three profiles gated clean here and still killed
+  # a live inference server. So when the persisted profile names a serial, apply it ONLY to that
+  # card. Without this, plugging in a second 170HX silently inherits the first card's overclock at
+  # boot, unqualified, which is the exact failure the gate exists to prevent.
+  if [ -n "${OC_SERIAL:-}" ] && [ "$serial" != "$OC_SERIAL" ]; then
+    echo "170hx-oc: skipping GPU $idx ($serial) - profile is qualified for $OC_SERIAL only"
+    continue
+  fi
+  if [ -z "${OC_SERIAL:-}" ] && [ "$multi" = 1 ]; then
+    echo "170hx-oc: REFUSING - $ngpu 170HX cards present and the profile names no serial."
+    echo "170hx-oc: qualification is per-card. Re-persist with 170tune so OC_SERIAL is recorded,"
+    echo "170hx-oc: or apply by hand to the card you have actually gated."
+    continue
+  fi
   nvidia-smi -i "$idx" -pl "$PL" >/dev/null 2>&1 \
     || echo "170hx-oc: GPU $idx power limit $PL W REFUSED"
   /usr/local/bin/nvml_oc "$OFFSET" 0 "$idx" >/dev/null 2>&1 \

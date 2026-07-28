@@ -557,6 +557,7 @@ cmd_apply() {
 
 persist_write_conf() {
     local prof=$1 off=${2:-} clk=${3:-}
+    local card_serial; card_serial=$(serial 2>/dev/null || true)
     mkdir -p "$(dirname "$PERSIST_CONF")"
     {
         echo "# written by '170tune persist' on $(date -Is). Read by $PERSIST_UNIT at boot."
@@ -564,6 +565,10 @@ persist_write_conf() {
         echo "PROFILE=$prof"
         [ -n "$off" ] && echo "OC_OFFSET=$off"
         [ -n "$clk" ] && echo "OC_CLK=$clk"
+        # QUALIFICATION IS PER-CARD, so the profile names the card it was gated on. 170hx-oc
+        # applies it to that serial only, and refuses to guess when several 170HX are present.
+        # Without this, adding a second card silently inherits the first one's overclock at boot.
+        [ -n "${card_serial:-}" ] && echo "OC_SERIAL=$card_serial"
     } > "$PERSIST_CONF"
     chmod 644 "$PERSIST_CONF"
     sync
