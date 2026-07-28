@@ -252,9 +252,11 @@ THREE FAILURE MODES, IN ORDER OF NASTINESS
 
 HOW TO USE THIS TOOL
 
-  170tune try 300 1350        measure a point (fast, unverified)
-  170tune gate 300 1350 4     prove it with four full-VRAM pattern sweeps
-  170tune ladder 1350         find this card's safe ceiling at one clock
+  170tune try 200 1400        measure a point (fast, unverified)
+  170tune gate 200 1400 4     prove it with four full-VRAM pattern sweeps
+  170hx-soak 12 <workload>    the step that DECIDES: +300/1350 passed the gate with a
+                              workload rung and still faulted in round 1 of a soak
+  170tune ladder 1400         find this card's safe ceiling at one clock
   170tune qualify             the whole flow, recorded per serial
   170tune recover             put it back after a fault
 EOF
@@ -857,9 +859,10 @@ EXIT CODES
 TYPICAL SESSION
   170tune explain
   170tune selftest
-  170tune ladder 1350
-  170tune gate 300 1350 4
-  170tune apply eff --persist
+  170tune ladder 1400
+  170tune gate 200 1400 4 --workload <your workload>
+  170hx-soak 12 <your workload>
+  170tune persist custom 200 1400
   170tune persist status
 EOF
 }
