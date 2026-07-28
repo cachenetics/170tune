@@ -89,11 +89,12 @@ ngpu=$(nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null \
 multi=0; [ "${ngpu:-0}" -gt 1 ] && multi=1
 
 applied=0
+seen=0
 while IFS=, read -r idx devid serial; do
   idx="${idx// /}"; devid="${devid// /}"; serial="${serial// /}"
   # Guard: this host is the card-swap qualification bench - only ever touch a CMP 170HX (0x20C2).
   case "${devid,,}" in
-    *20c2*) : ;;
+    *20c2*) seen=$((${seen:-0} + 1)) ;;
     *) echo "170hx-oc: skipping GPU $idx (device id $devid is not a 170HX)"; continue ;;
   esac
   # Guard: QUALIFICATION IS PER-CARD. A gate receipt is written per serial and a point that soaks
@@ -121,10 +122,18 @@ while IFS=, read -r idx devid serial; do
   else
     nvidia-smi -i "$idx" -rgc >/dev/null 2>&1
   fi
-  got=$(/usr/local/bin/nvml_oc 2>/dev/null | awk '/current offset/{print $NF=="MHz" ? $(NF-1) : $NF; exit}')
+  # -i, not a bare read: without it this reports device 0's offset no matter which card was
+  # configured, which on a two-card box describes the wrong GPU.
+  got=$(/usr/local/bin/nvml_oc -i "$idx" 2>/dev/null | awk '/current offset/{print $NF=="MHz" ? $(NF-1) : $NF; exit}')
   lim=$(nvidia-smi -i "$idx" --query-gpu=power.limit --format=csv,noheader 2>/dev/null)
   echo "170hx-oc: GPU $idx ($serial) profile=$PROFILE offset=${got:-?} clk_max=${CLK:-unlocked} power_limit=${lim:-?}"
   applied=$((applied + 1))
 done < <(nvidia-smi --query-gpu=index,pci.device_id,serial --format=csv,noheader 2>/dev/null)
 
-[ "$applied" -gt 0 ] || { echo "170hx-oc: no 170HX present - nothing applied"; exit 0; }
+[ "$applied" -gt 0 ] || { if [ "${seen:-0}" -eq 0 ]; then
+    echo "170hx-oc: no 170HX present - nothing applied"
+  else
+    # Distinguish "none here" from "all skipped": saying no card is present when two are, and
+    # were deliberately skipped, sends the reader looking for a hardware fault.
+    echo "170hx-oc: $seen 170HX present, none applied - see the skip reasons above"
+  fi; exit 0; }
