@@ -18,7 +18,7 @@ say "building probes for $ARCH"
 cc -O2 -o tools/nvml_oc tools/nvml_oc.c -I"$CUDA/include" -lnvidia-ml
 
 say "installing to /usr/local/bin"
-sudo install -m 755 tools/170tune tools/170hx-oc tools/170hx-sweep /usr/local/bin/
+sudo install -m 755 tools/170tune tools/170hx-oc tools/170hx-sweep tools/170hx-soak /usr/local/bin/
 sudo install -m 755 tools/oc_eff tools/compute_check tools/mem_probe tools/gemm_probe tools/gpu_selftest tools/ctx_probe tools/nvml_oc /usr/local/bin/
 # A worked --workload rung. Installed as an example to copy, not as something 170tune calls: the
 # rung has to be YOUR engine, and this one knows about a particular vLLM unit and model path.
@@ -41,8 +41,10 @@ say ""
 say "installed. Next:"
 say "  170tune explain      what the levers are"
 say "  sudo 170tune selftest    prove the detectors work on this box"
-say "  sudo 170tune gate 300 1350 4   prove a point on THIS card"
-say "  sudo 170tune persist eff       adopt it, now and at every boot"
+say "  sudo 170tune gate 200 1400 4 --workload <your workload>   prove a point on THIS card"
+say "  sudo 170hx-soak 12 <your workload>   the step that decides: a gated point with a"
+say "                                       workload rung still faulted on the reference card"
+say "  sudo 170tune persist custom 200 1400   adopt it, now and at every boot"
 say ""
 say "The gate runs 170hx-sweep (installed above): a full-VRAM unique-pattern write/verify plus"
 say "an exact compute checksum. Substitute a fuller bench harness with BENCH=/path if you have"

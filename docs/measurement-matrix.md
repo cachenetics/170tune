@@ -9,6 +9,41 @@ mean the point is safe: `+325 / 1400` completes happily and silently corrupts me
 shipped profiles carry the integrity gate (2-4 full-VRAM pattern sweeps). Anything else in this
 table is unverified.
 
+**And read this second: a GEMM number does not predict whether a point can serve.** `+300/1350` is
+the best GFLOPS/W cell in this whole document, gated 4/4 hot, passed a real-workload rung, served a
+full day of benchmarks - and then faulted with Xid 13 under an hour-long soak. The qualification
+matrix below, not the GEMM matrix here, is what decides what ships.
+
+## Qualification matrix: which points survive real serving
+
+Gated 4/4 with a workload rung, then soaked against long-context prompts and multi-step
+generations under vLLM. This is the table to ship from.
+
+| offset | 1200 | 1350 | 1400 | 1470 | 1590 | 1650 |
+|---|---|---|---|---|---|---|
+| **+200** | **CLEAN** | - | **CLEAN** | - | - | - |
+| **+250** | **CLEAN** | - | **CLEAN** | - | - | - |
+| **+300** | - | FAULT | FAULT | FAULT | - | FAULT |
+| **+350** | - | - | - | - | FAULT | FAULT |
+
+Serving numbers at the qualified points (Qwen3.6-27B INT8, fp8 KV, MTP, concurrency 24):
+
+```
+point             decode    prefill   watts   core C   HBM C   tok/s per W
++200/1200 @200W    303.0     2,329     149      59       66       2.03   <- peak efficiency
++250/1200 @200W    303.6     2,331     152      59       66       2.00
++200/1400 @300W    341.8     2,668     181      60       66       1.89   <- peak throughput
++250/1400 @300W    342.9     2,669     178      62       67       1.93
+```
+
+`+250` is stable and buys nothing worth having: identical at 1200 while drawing 3 W more, and 2%
+more efficient at 1400. The shipped profiles stay at `+200`, one full step below the offset that
+has faulted at three separate ceilings.
+
+Note what this says about the risk lever. It is neither the offset nor the ceiling alone: `+250`
+survives 1400 where `+300` dies, and `+300` dies at low clocks too. What matters is
+voltage-at-frequency, and `+300` crosses the line everywhere tested on this card.
+
 ## bf16 TFLOPS / watts
 
 | ceiling | +0 | +150 | +200 | +250 | +300 | +325 | +350 | +355 | +360 | +375 | +400 | +450 |
@@ -47,7 +82,7 @@ table is unverified.
 
 * **CORRUPT** - completes, but the full-VRAM sweep returns memory errors (silent data corruption).
 * **corrupt\*** - `+400/1350` passed two sweeps, then returned `mem_errors=1` on a later one. This is
-  why the shipped `eff` sits at `+300/1350` rather than higher: it draws the same ~131 W as
+  why `eff` sat at `+300/1350` rather than higher: it draws the same ~131 W as
   anything above it on the flat floor, with margin below the point that misbehaved.
 * **fault** - CUDA device fault under load (`illegal instruction`, `illegal memory access`, cublas 14).
 * **HANG** - GPU wedged, needs a reboot (and sometimes a power cycle).
@@ -77,6 +112,9 @@ table is unverified.
 | eff (+300/1350) | 1685.9 GB/s | 1599.3 GB/s | 296.1 ns |
 | match (+250/1400) | 1690.2 GB/s | 1597.6 GB/s | 288.3 ns |
 | max (+350/1650) | 1698.2 GB/s | 1584.8 GB/s | 253.2 ns |
+
+(`eff` and `max` appear in this bandwidth table because it predates their quarantine; the figures
+stand as measurements of those clock points, they are just no longer shippable.)
 
 Streaming bandwidth is essentially profile-independent (whole spread under 1%, and `eff` leads on
 triad). Memory LATENCY is not: 253 ns at `max` against 296 ns at `eff`, a 17% spread, because the

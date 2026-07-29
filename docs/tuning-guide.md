@@ -409,6 +409,43 @@ independently confirmed by patching the kernel module and measuring
   above the A100 80GB and above HBM2e nominal. NVIDIA spent the memory headroom at the
   factory. Do not re-run the PLL sweep; it is closed by measurement.
 
+### Idle and resting power
+
+Measured on a serving box after a clean reboot, office profile (+200/1200 @200W):
+
+```
++---------------------------------+-----------+-----------+---------+
+| state                           | sm clock  | mem clock | draw    |
++---------------------------------+-----------+-----------+---------+
+| inference server resident, 0%   | 1140 MHz  | 1728 MHz  | 40.2 W  |
+| true idle, no CUDA context      |  405 MHz  | 1728 MHz  | 36.9 W  |
++---------------------------------+-----------+-----------+---------+
+```
+
+Holding a 36 GB model resident costs **3.3 W**. That is the whole saving available from unloading
+it between requests, against a 4 to 5 minute cold start on the next one.
+
+The SM side idles correctly without help - 405 MHz bare, 1140 MHz with a context - which is what
+the `-lgc 210,<max>` form preserves. Pin the ceiling with `<max>,<max>` instead and you lose it.
+
+The remaining ~37 W is HBM refresh at a memory clock that never moves. **With stock tooling there
+is no lever on it:**
+
+```
+supported memory clocks      1728 MHz      (exactly one)
+nvidia-smi -lmc 405          "Setting locked Memory clocks is not supported"
+MEM VF offset range          [0 .. +0]     the driver refuses memory offsets on this part
+```
+
+With the patched module described below the memory clock *can* be driven down, and since the PLL
+follows down that should reduce resting draw as well as load draw. It has not been measured at
+idle, and it is not something to run on a production box: it needs a patched kernel module, and it
+costs bandwidth the moment real work arrives. For a normally-configured card, treat **~40 W per
+card at rest as the floor** short of powering it off.
+
+Idle fan on the reference card is 1909 rpm against roughly 2700 under load, so a resting card is
+close to silent.
+
 ### Memory underclock is a power lever (downward only)
 
 Because the PLL follows down, underclocking is free power on compute-bound work where the
