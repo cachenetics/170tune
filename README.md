@@ -469,6 +469,9 @@ tools/gpu_selftest.cu   full-VRAM sweep: unique-per-address 64-bit pattern verif
 tools/ctx_probe.cu      the smallest proof the card is USABLE: create a context, allocate,
                         launch, read back. Catches the wedge nvidia-smi cannot see
 tools/vllm_workload_check.sh  worked 'gate --workload' rung against a real vLLM service
+tools/setup-vllm-170hx.sh     stand vLLM up on a 170HX from scratch; refuses tensor
+                        parallel over Gen2 x4, fails on a still-locked VBIOS, pins the
+                        card by UUID. '--check-only' diagnoses without changing anything
 tools/170hx-soak        repeat a workload for hours and fail on any new Xid; what decides
                         whether a gated point can actually be shipped
 tools/oc_eff.cu         sustained bf16 GEMM with in-process NVML power sampling
