@@ -1,8 +1,13 @@
 // Sanctioned-OC probe: the driver exports nvmlDeviceSet{GpcClk,MemClk}VfOffset and
 // nvmlDeviceSetClockOffsets even though nvidia-smi only surfaces the negative direction
 // (--set-vf-derate). Query the allowed VF-offset range, then optionally apply one.
-//   usage: nvml_oc                            # report only (device 0)
-//          nvml_oc <gpcMHz> <memMHz> [devIdx]  # apply offsets (0 is a valid value)
+//   usage: nvml_oc                              # report only (device 0)
+//          nvml_oc -i <devIdx>                  # report only, a SPECIFIC device
+//          nvml_oc <gpcMHz> <memMHz> [devIdx]   # apply offsets (0 is a valid value)
+//
+// The -i read form exists because without it every read landed on device 0. On a two-card box
+// that made 170hx-oc report card 0's offset while configuring card 1 - a check describing the
+// wrong card, which is worse than no check.
 #include <nvml.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +19,14 @@
 int main(int argc, char **argv) {
     nvmlReturn_t r = nvmlInit_v2();
     if (r != NVML_SUCCESS) { printf("nvmlInit: %s\n", nvmlErrorString(r)); return 1; }
-    unsigned idx = (argc >= 4) ? (unsigned)atoi(argv[3]) : 0u;
+    int a = 1;                       // first positional argument
+    unsigned idx = 0u;
+    if (argc >= 3 && (strcmp(argv[1], "-i") == 0 || strcmp(argv[1], "--device") == 0)) {
+        idx = (unsigned)atoi(argv[2]);
+        a = 3;
+    } else if (argc >= 4) {
+        idx = (unsigned)atoi(argv[3]);
+    }
     nvmlDevice_t d;
     if ((r = nvmlDeviceGetHandleByIndex_v2(idx, &d)) != NVML_SUCCESS) {
         printf("handle: %s\n", nvmlErrorString(r)); return 1; }
@@ -62,8 +74,8 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    if (argc >= 3) {
-        int gpc = atoi(argv[1]), mem = atoi(argv[2]);
+    if (argc - a >= 2) {
+        int gpc = atoi(argv[a]), mem = atoi(argv[a + 1]);
         int setGpc = 1, setMem = 1;   // 0 is a VALID offset (= stock), always apply
         printf("\napplying offsets: gpc=%+d MHz  mem=%+d MHz\n", gpc, mem);
         if (setGpc) {
