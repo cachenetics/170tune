@@ -52,6 +52,12 @@ die() { printf '%s%s%s\n' "$c_bad" "$*" "$c_off" >&2; exit 1; }
 
 need_root() { [ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"; }
 serial() { nvidia-smi --query-gpu=serial --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+# Live HBM clock. This is DRIVER-WIDE state set at module load (cmpunlocker --mclk-ndiv), not a
+# per-card knob, and it is NOT visible in clocks.max.memory - that keeps reporting the stock value.
+# It belongs in the receipt because a gate earned at 1728 MHz says nothing about a card later
+# running at 1890: more DRAM speed is exactly the regime that produces SILENT corruption.
+mclk() { nvidia-smi --query-gpu=clocks.current.memory --format=csv,noheader,nounits 2>/dev/null \
+         | head -1 | tr -d ' '; }
 devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
 xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
 
@@ -112,7 +118,7 @@ write_receipt() {
     local off=$1 clk=$2 n=$3 tmax=$4 wl=${5:-} f; f=$(receipt_file "$off" "$clk")
     mkdir -p "$(dirname "$f")"
     cat > "$f" <<EOF
-{"serial": "$(serial)", "offset": $off, "ceiling": $clk, "sweeps": $n, "peak_hbm_c": ${tmax:-0},
+{"serial": "$(serial)", "offset": $off, "ceiling": $clk, "mclk_mhz": $(mclk), "sweeps": $n, "peak_hbm_c": ${tmax:-0},
  "compute_check": $([ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ] && echo true || echo false),
  "workload": $([ -n "$wl" ] && printf '"%s"' "$(printf '%s' "$wl" | tr -d '"\\')" || echo null),
  "gated": "$(date -Is)"}
@@ -271,6 +277,9 @@ cmd_status() {
         say "${c_bad}  (clocks and NVML look healthy in this state - they are not evidence)${c_off}"
     fi
     printf 'serial      : %s\n' "$(serial)"
+    # Driver-wide, set at module load, and NOT reflected in clocks.max.memory - so show it, or a
+    # rebuild can change the DRAM speed under a profile with nothing on screen saying so.
+    printf 'memory clock: %s MHz%s\n' "$(mclk)" "$( [ "$(mclk)" != "1728" ] && echo '  (NON-STOCK - driver built with --mclk-ndiv)' )"
     printf 'offset      : %s MHz\n' "$(cur_offset)"
     nvidia-smi --query-gpu=clocks.max.sm,clocks.sm,clocks.mem,power.limit,power.draw,temperature.gpu,temperature.memory,memory.total \
         --format=csv 2>/dev/null | sed 's/^/            /'
@@ -656,6 +665,9 @@ cmd_persist() {
         local sweeps=0 peak=0
         [ -f "$rf" ] && sweeps=$(grep -oE '"sweeps": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
         [ -f "$rf" ] && peak=$(grep -oE '"peak_hbm_c": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
+        local rec_mclk live_mclk
+        [ -f "$rf" ] && rec_mclk=$(grep -oE '"mclk_mhz": *[0-9]+' "$rf" | grep -oE '[0-9]+$')
+        live_mclk=$(mclk)
         if [ ! -f "$rf" ]; then
             say "${c_bad}NOT GATED on this card (serial $(serial)): no receipt for offset=+$off ceiling=$clk${c_off}"
             say "  the numbers in the profile table are the REFERENCE card's silicon, not yours."
@@ -668,6 +680,15 @@ cmd_persist() {
             say "  strengthen it:  170tune gate $off $clk 4"
             [ "$force" = 1 ] || return 1
             say "${c_warn}  --force: persisting on ${sweeps} sweep(s) anyway${c_off}"
+        elif [ -n "${rec_mclk:-}" ] && [ -n "${live_mclk:-}" ] && [ "$rec_mclk" != "$live_mclk" ]; then
+            # The memory clock is DRIVER-WIDE state a rebuild can change without touching this
+            # profile, and more DRAM speed is the classic silent-corruption regime. A receipt earned
+            # at one memory clock is not evidence about another, so refuse rather than assume.
+            say "${c_bad}memory clock changed since this point was gated: receipt ${rec_mclk} MHz, card now ${live_mclk} MHz.${c_off}"
+            say "  a gate proves the offset AND the memory clock it ran at - it is not evidence about a different one."
+            say "  re-gate at the current clock:  170tune gate $off $clk 4"
+            [ "$force" = 1 ] || return 1
+            say "${c_warn}  --force: persisting across a memory-clock change anyway${c_off}"
         elif [ "${peak:-0}" -lt "$GATE_TEMP" ]; then
             # A cold gate is the documented way to bless a setting that fails in service: +325/1400
             # passed 4/4 sweeps at 37-43C HBM and returned mem_errors=4 after a soak to 59C.

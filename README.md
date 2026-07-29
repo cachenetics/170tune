@@ -509,12 +509,32 @@ coefficient encoding, and the `FBPA_PLL` priv-level-mask entry `0x009a3c7c` that
 in the post-BooterLoad window. The memory-clock section of the guide is built on that
 map, and finding it independently would have cost weeks.
 
-Our measurements disagree with that fork's conclusion: raising the memory PLL does not
-raise delivered bandwidth on this part, because the DRAM runs at the rate it was
-trained at and the stacks already ship at 3.456 Gbps per pin, above HBM2e nominal. That
-is a disagreement about what the lever buys, not about the register work, which is
-sound. Running the same lever downward is what proved the PLL genuinely reaches the
-DRAM, and it is a usable power saving in its own right.
+**They were right and we were wrong, and the correction is worth stating plainly.** An earlier
+version of this section claimed our measurements disagreed with that fork: that raising the
+memory PLL did not raise delivered bandwidth, because the DRAM runs at the rate it was trained
+at. That conclusion is retracted. The memory clock does move - 1728 to 1890 MHz - and the
+bandwidth is real, proven by exceeding the theoretical ceiling of the stock clock (1782 GB/s
+measured against a 1769 GB/s peak at 1728 MHz, which is impossible unless the clock changed).
+
+We had been measuring the wrong write. Their implementation differs from the naive approach in
+three ways, and any one of them alone is enough to make the register appear to accept a value
+while the clock never moves:
+
+* the write must land **post-GSP**, after `kgspStartLogPolling` - a pre-GSP write is
+  reprogrammed by GSP's own devinit;
+* it must be **multicast** to all eight FBPAs (`0x0098BC98`), not unicast per partition
+  (`0x00903C98`, which is the read address);
+* it needs a **PRI fence and a PLL-lock poll** before the clock can be trusted.
+
+The post-GSP insight is the same shape as the Gen2 transient window, arrived at independently:
+the register was never the problem, the moment was. Their patch also keeps the VBIOS MDIV/PDIV
+and swaps only NDIV so it is VBIOS-independent, and leaves the NDIV literal uncompilable until
+substituted so an unpatched tree cannot silently build stock - both good engineering we have
+since copied.
+
+On this card the lever buys about 2% of serving throughput, because an INT8 inference workload is
+compute-bound at these clocks rather than bandwidth-bound. That is a statement about our workload,
+not about their work.
 
 **This project** contributes what sits on top of all of that: the tuning, the
 measurement discipline, the integrity gate and the recovery path. The link-training
