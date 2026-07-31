@@ -3,11 +3,27 @@
 # Installs to /usr/local/bin and enables the boot-check unit. Nothing is overclocked by installing.
 set -euo pipefail
 cd "$(dirname "$0")"
-CUDA=${CUDA:-/opt/cuda}
 ARCH=${ARCH:-sm_80}          # GA100. Change only if you know what you are doing.
 say() { printf '%s\n' "$*"; }
 
-command -v "$CUDA/bin/nvcc" >/dev/null || { echo "nvcc not found at $CUDA/bin/nvcc - set CUDA=..."; exit 1; }
+# CUDA toolkit location varies by distro: /opt/cuda (Arch/CachyOS), /usr/local/cuda (NVIDIA's
+# official .run/.deb installers), /usr/lib/cuda (some Ubuntu apt packages). Try PATH first (an
+# already-active toolchain, e.g. from a module load or manual PATH export), then the common
+# install roots, before giving up. Override with CUDA=/path/to/cuda if none of this finds yours.
+if [ -n "${CUDA:-}" ]; then
+  :
+elif command -v nvcc >/dev/null; then
+  CUDA=$(dirname "$(dirname "$(command -v nvcc)")")
+else
+  for c in /opt/cuda /usr/local/cuda /usr/lib/cuda; do
+    [ -x "$c/bin/nvcc" ] && { CUDA=$c; break; }
+  done
+fi
+command -v "${CUDA:-}/bin/nvcc" >/dev/null 2>&1 || {
+  echo "nvcc not found (tried \$PATH, /opt/cuda, /usr/local/cuda, /usr/lib/cuda)."
+  echo "Set CUDA=/path/to/cuda-toolkit-root (the dir containing bin/nvcc) and re-run."
+  exit 1
+}
 say "building probes for $ARCH"
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/oc_eff        tools/oc_eff.cu        -lcublas -lnvidia-ml
 "$CUDA/bin/nvcc" -O3 -arch=$ARCH -o tools/compute_check tools/compute_check.cu -lcublas
