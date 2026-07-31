@@ -43,7 +43,9 @@ GATE_SOAK_MAX=${GATE_SOAK_MAX:-180}  # give up soaking after this many seconds
 GATE_COMPUTE=${GATE_COMPUTE:-45} # seconds of bit-exact GEMM checking per gate
 SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-600}
 WORKLOAD_TIMEOUT=${WORKLOAD_TIMEOUT:-900}  # 'gate --workload <cmd>': a workload that hangs is a FAIL
-DEVID_170HX=20c2
+# Both shipped 170HX SKUs: 8GB (0x20C2, 64GB unlock) and 10GB (0x2082, 40GB unlock). A 16GB ROM
+# exists but was never shipped (see RUNBOOK.md), so it is deliberately not matched here.
+DEVID_170HX_PATTERNS="20c2 2082"
 
 c_hi=$'\033[1m'; c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_bad=$'\033[31m'; c_off=$'\033[0m'
 [ -t 1 ] || { c_hi=""; c_ok=""; c_warn=""; c_bad=""; c_off=""; }
@@ -61,7 +63,13 @@ mclk() { nvidia-smi --query-gpu=clocks.current.memory --format=csv,noheader,noun
 devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
 xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
 
-is_170hx() { case "$(devid)" in *$DEVID_170HX*) return 0 ;; *) return 1 ;; esac; }
+is_170hx() {
+    local d p; d="$(devid)"
+    for p in $DEVID_170HX_PATTERNS; do
+        case "$d" in *"$p"*) return 0 ;; esac
+    done
+    return 1
+}
 
 wedged() {
     # a wedged GPU reports N/A for clocks and nvml_oc cannot read its offset
