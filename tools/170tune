@@ -28,6 +28,10 @@
 #   preflight                      read-only checklist before tuning a new card/box
 #   snapshot-stock                 read this card's current values, save them as its stock override
 set -uo pipefail
+# systemd runs boot-apply/boot-check with no HOME; under set -u the find_tool $HOME fallbacks
+# below would abort with "HOME: unbound variable". Default it so those lines are harmless (the
+# real tools resolve from /usr/local/bin first anyway).
+: "${HOME:=/root}"
 
 STATE=/var/lib/170tune
 # Paths must survive sudo, where $HOME becomes /root. Resolve against the INVOKING user's home.
@@ -765,6 +769,11 @@ cmd_boot_check() {
     mkdir -p "$STATE"
     { echo "{\"detected\": \"$(date -Is)\", \"note\": \"this setting was in flight when the machine went down\", \"armed\":"; cat "$STATE/armed.json"; echo "}"; } > "$STATE/last_crash.json"
     disarm
+    # boot-check runs Before= boot-apply and just cleared the armed marker, so boot-apply's OWN
+    # self-disarm can no longer see the stale marker. Signal it to STAY STOCK this boot, so a
+    # profile that was in flight during a crash is NOT re-applied (that is the wedge-on-every-boot
+    # failure this whole mechanism exists to prevent). The flag is keyed to this boot_id.
+    printf '%s\n' "$this_boot" > "$STATE/persist-skip-boot"; sync
     "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
     logger -t 170tune "reverted to stock: a tuning run did not check in before the machine went down (see $STATE/last_crash.json)"
     say "reverted to stock. The run that did not check in is recorded in $STATE/last_crash.json"
@@ -1320,6 +1329,17 @@ cmd_boot_apply() {
     local s; s=$(serial)
     local conf="$PERSIST/$s.conf"
     [ -f "$conf" ] || { logger -t 170tune "boot-apply: no profile for ${s:-unknown}, staying stock"; exit 0; }
+    # boot-check (runs Before= us) sets this flag, keyed to this boot_id, when it detected a
+    # mid-flight crash and reverted to stock. Honor it: do NOT re-apply the profile that may have
+    # caused the crash. A flag from a prior boot has a different id and is cleared as stale.
+    if [ -f "$STATE/persist-skip-boot" ]; then
+        local sb; sb=$(cat "$STATE/persist-skip-boot" 2>/dev/null)
+        rm -f "$STATE/persist-skip-boot"
+        if [ "$sb" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+            logger -t 170tune "boot-apply: boot-check flagged a mid-flight crash this boot - staying STOCK (see $STATE/last_crash.json)"
+            exit 0
+        fi
+    fi
     if [ -f "$STATE/armed.json" ]; then
         local ab tb; ab=$(grep -oE '"boot_id": "[^"]+"' "$STATE/armed.json" | cut -d'"' -f4); tb=$(cat /proc/sys/kernel/random/boot_id)
         if [ "$ab" != "$tb" ]; then
@@ -1580,7 +1600,7 @@ cmd_preflight() {
     # what a fresh preflight is about to send the user toward.
     case "$(mclk_source)" in
         driver-baked*)
-            say "${c_bad}[FAIL]${c_off} memory clock is stock (as reported by the driver)"
+            say "${c_bad}[FAIL]${c_off} memory clock source (driver-baked, unsupported for tuning)"
             say "       $(mclk_source) - the driver's own idea of \"current\" mclk is already non-stock,"
             say "       most likely built with cmpunlocker's --mclk-ndiv. snapshot-stock, mclk-try/mclk-gate"
             say "       and persist save all refuse on this driver: rebuild a stock driver and use this"
@@ -1588,7 +1608,7 @@ cmd_preflight() {
             hard_fail=1
             ;;
         unknown) say "${c_warn}[warn]${c_off} memory clock source - could not read nvidia-smi's mclk; skipping the check" ;;
-        *) say "${c_ok}[ok]${c_off}   memory clock is stock (as reported by the driver): $(mclk_source)" ;;
+        *) say "${c_ok}[ok]${c_off}   memory clock source: $(mclk_source)" ;;
     esac
 
     # BAR0 + PLM both need to READ registers, which requires root (the BAR0 mmap). Without root
@@ -1677,10 +1697,13 @@ cmd_snapshot_stock() {
     done
     rebuilt=${rebuilt# }
 
-    if [ "$ndiv" -gt 66 ] 2>/dev/null; then
-        say "${c_warn}[warn] current NDIV is $ndiv (> 66, above the normal stock range) - this card"
-        say "  may already be tuned, not at stock. Snapshotting it anyway will capture whatever is"
-        say "  live right now; revert to a known stock state first if that is not what you want.${c_off}"
+    # Premise-free poisoned-reference guard. A 170HX at true stock is NDIV 64; anything above the
+    # stock range means the card is tuned OR the driver was baked with --mclk-ndiv (which sets the
+    # PLL COEFF at module load, so hbm_mclk reads it back here directly - no reliance on whether
+    # nvidia-smi reflects it). Capturing that as "stock" would poison the reference every gate and
+    # every self-disarm falls back to, so refuse rather than warn. This backstops refuse_if_mclk_baked.
+    if [ "${ndiv:-0}" -gt 66 ] 2>/dev/null; then
+        die "refusing snapshot-stock: current NDIV is $ndiv, not stock ($STOCK_NDIV). The card is tuned or the driver is baked with --mclk-ndiv; snapshotting now would poison the stock reference. Revert to stock (170tune reset; rebuild a stock driver if it was baked; reboot), then re-run."
     fi
 
     mkdir -p "$STATE/stock"
