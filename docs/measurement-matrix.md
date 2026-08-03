@@ -124,5 +124,11 @@ keep the 68 W; latency-bound work should pay for a high-clock profile.
 Spread is ~1%. Streaming reads favour the high-clock profiles, triad (read+write, the better proxy
 for decode) peaks at `match`. Theoretical peak at 1728 MHz on a 4096-bit bus is 1769 GB/s, so we are
 at 95-96% of it; the remaining 4% is protocol overhead, not a setting. ECC is `N/A` on this SKU, so
-there is no ECC-off lever. The memory clock cannot go up (see
-`hbm_mclk_oc_measured_2026-07-27.md`); it can go down, which is a power lever, not a bandwidth one.
+there is no ECC-off lever.
+
+This table is the SM (GPC clock/voltage) matrix; it measures bandwidth at the STOCK 1728 MHz
+memory clock across every SM profile, which is still valid - the SM offset/ceiling do not move
+the memory clock. The memory clock itself is a separate, live BAR0 lever (`170tune mclk-try` /
+`mclk-gate`, up to a gated ceiling of NDIV 76 on the reference card) - an earlier note here
+claiming it "cannot go up" was corrected: see `170tune explain-hbm` and
+[`hbm-matrix.md`](hbm-matrix.md) for the current HBM measurement matrix and model.

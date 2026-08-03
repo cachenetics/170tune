@@ -383,31 +383,39 @@ So the profile choice for a memory-heavy workload depends on which one it is bou
 * latency-bound (small-batch or dependent-chain work, sparse gather, graph traversal): the
   high-clock profiles are worth real money, up to 17% lower latency at `max`.
 
-### Memory overclock is closed, and why
+### Memory overclock: RETRACTED - it is not closed, it is live (corrected 2026-08-03)
 
-The MEM clock VF offset range is `[0 .. 0]`: the driver refuses it on this part. That was
-independently confirmed by patching the kernel module and measuring
-(`analysis/hbm_mclk_oc_measured_2026-07-27.md`). The findings:
+Earlier revisions of this section claimed the driver's `MEM clock VF offset` refusal
+(`[0 .. 0]`, still true - the NVML path really is closed) meant memory overclock itself was
+closed by measurement, including up-clocking. **That conclusion is retracted.** The NVML path is
+the wrong write. The memory clock has its own PLL, reachable directly over BAR0 (`hbm_mclk`,
+`0x009a3c7c` etc. - see the credited work in the repo README's Attribution section), and it moves
+in both directions, live, with no driver rebuild and no reboot:
 
-- The PLL follows down but not up. Underclocking proves the knob is real and causal:
-  NDIV 65 (-6.25% clock) delivered -6.8% bandwidth, and latency rose. Up-clocking
-  delivers nothing: NDIV 70 (+4.9% request) measured the same bandwidth as stock, with no
-  memory errors and no soft roll-off. The register accepts the new coefficient
-  (0x00014601 for NDIV 70) with the PLL lock bit set, yet the DRAM clock does not move up.
-  Zero gain with no errors and no roll-off is the signature of a hard clamp at the stock
-  rate: the PLL fails to lock, or the DRAM clamps, above the trained rate.
-- No Memory Clock Table in any of the 8 ROMs. The trained rate comes from FWSEC devinit
-  at 1728 MHz at POST, not from a table you can edit.
-- The PTRIM lead is refuted. A whole-8-ROM hunt for the PLL coefficient encoding found
-  864 MHz PLLs (FBPA block at 0x903C7C etc.) that do not track the memory clock; the mclk
-  path is the FBPA coefficient. Booting at NDIV 60 (demonstrably lower delivered rate,
-  read 1574.7 GB/s) and diffing the register dump showed only the FBPA PLL pair changed,
-  confirming the clamp is not a PTRIM register anyone can reach.
-- Structural reason there was never headroom: per-pin data rate is 2x the mclk. An A100
-  80GB runs 1215 MHz = 2.43 Gbps/pin; an A100 40GB runs 1593 MHz = 3.19 Gbps/pin
-  (HBM2e nominal top ~3.2); the 170HX already runs 1728 MHz = 3.456 Gbps/pin, about 6-8%
-  above the A100 80GB and above HBM2e nominal. NVIDIA spent the memory headroom at the
-  factory. Do not re-run the PLL sweep; it is closed by measurement.
+- The write must land **post-GSP** (after `kgspStartLogPolling` - a pre-GSP write is
+  reprogrammed by GSP's own devinit), must be **multicast** to all FBPAs (not unicast to one
+  partition, which is what a naive read/write address gets you), and needs a **PRI fence and a
+  PLL-lock poll** before the clock can be trusted. The earlier "up-clocking delivers nothing"
+  finding was measuring the wrong write, not a real hardware clamp - once the write lands
+  correctly the clock genuinely moves, proven by bandwidth exceeding the theoretical ceiling of
+  the stock rate (impossible unless the clock rose - `nvidia-smi` cannot show this: its
+  `clocks.current.memory` field is blind to this class of write and always reports stock).
+- `nvidia-smi`'s own read (`clocks.current.memory` / `-lmc`) is still exactly as limited as this
+  section originally said - it cannot lock a memory clock and it does not reflect a live BAR0
+  write - but that is a limitation of `nvidia-smi`, not of the hardware.
+
+The whole HBM model - the NDIV lever, why it is derived, the DRAM timings that bind past the bare
+ceiling, the refresh power lever, and the three measured ceilings (76 robust / 77 thermal-marginal
+/ 78 read-eye wall) - is now `170tune explain-hbm` and
+[`../docs/hbm-matrix.md`](hbm-matrix.md), the canonical HBM reference. This section is left in
+place, retracted rather than deleted, because the correction itself - "we had been measuring the
+wrong write" - is worth keeping visible.
+
+One real hazard this correction surfaces: a driver **compiled** with cmpunlocker's
+`--mclk-ndiv` flag bakes a non-stock memory clock into devinit, which is a DIFFERENT mechanism
+from the live BAR0 write above, and `nvidia-smi` DOES correctly reflect that one (it is the
+driver's own belief about "current"). `170tune` will not tune on top of a driver in that state -
+see the mclk misclassification guard in `170tune explain-hbm` / the repo README.
 
 ### Idle and resting power
 
@@ -428,67 +436,86 @@ it between requests, against a 4 to 5 minute cold start on the next one.
 The SM side idles correctly without help - 405 MHz bare, 1140 MHz with a context - which is what
 the `-lgc 210,<max>` form preserves. Pin the ceiling with `<max>,<max>` instead and you lose it.
 
-The remaining ~37 W is HBM refresh at a memory clock that never moves. **With stock tooling there
-is no lever on it:**
+The remaining ~37 W is HBM refresh at a memory clock `nvidia-smi` reports as fixed. As the
+correction above explains, that is `nvidia-smi`'s limitation, not the hardware's: the refresh
+interval is itself a live BAR0 lever now (`170tune refresh`), and it is the one that actually
+targets this idle/resting power, not the clock:
 
 ```
-supported memory clocks      1728 MHz      (exactly one)
-nvidia-smi -lmc 405          "Setting locked Memory clocks is not supported"
-MEM VF offset range          [0 .. +0]     the driver refuses memory offsets on this part
+supported memory clocks (nvidia-smi)   1728 MHz  (exactly one - nvidia-smi cannot lock or read a
+                                                    live BAR0 clock/refresh change; see explain-hbm)
+MEM VF offset range (NVML)             [0 .. +0]  the driver refuses memory offsets via NVML
 ```
 
-With the patched module described below the memory clock *can* be driven down, and since the PLL
-follows down that should reduce resting draw as well as load draw. It has not been measured at
-idle, and it is not something to run on a production box: it needs a patched kernel module, and it
-costs bandwidth the moment real work arrives. For a normally-configured card, treat **~40 W per
-card at rest as the floor** short of powering it off.
+Measured on the HBM matrix work (see `docs/hbm-matrix.md`): loosening the refresh interval alone
+cuts idle power ~41 -> 35 W (-15%) and steady load power ~11-14% at every NDIV tested, with
+latency flat-to-better and no bandwidth cost - the retention margin at operating temperature is
+large. That is now the recommended idle/power lever, not an underclock: `170tune refresh gate`
+proves an interval hot on the target card, and `170tune persist save --timings "REFRESH <f>"`
+ships it. See `170tune explain-hbm` for the full retention/power/bandwidth model and the
+temperature caveat (retention margin shrinks with heat, so keep stock refresh for hot or
+unknown-thermal deployments).
 
 Idle fan on the reference card is 1909 rpm against roughly 2700 under load, so a resting card is
 close to silent.
 
-### Memory underclock is a power lever (downward only)
+### Memory clock as a power lever, both directions (corrected)
 
-Because the PLL follows down, underclocking is free power on compute-bound work where the
-HBM is over-provisioned. Measured with the patched module at NDIV 60 (1620 MHz) and
-NDIV 52 (1404 MHz), core profiles unchanged:
-
-```
-+------------------+---------------------------+---------------------------+---------------------------+
-| profile          | mem 1728 (stock)          | mem 1620                  | mem 1404                  |
-+------------------+---------------------------+---------------------------+---------------------------+
-| perf (+350/1590) | 212.2 TF / 181.2 W / 1171 | 211.6 TF / 172.9 W / 1224 | 210.5 TF / 169.3 W / 1243 |
-| eff (+300/1350)  | 180.8 TF / 131.2 W / 1378 | 180.7 TF / 130.2 W / 1388 | 180.7 TF / 132.7 W / 1362 |
-| read bandwidth   | 1695 GB/s                 | 1582 GB/s                 | 1279 GB/s                 |
-+------------------+---------------------------+---------------------------+---------------------------+
-```
-
-- At `perf`, dropping memory one step (1728 -> 1620) saves 8.3 W for 0.3% throughput, a
-  4.5% efficiency gain, and it passed the pattern sweep.
-- The second step (-> 1404) adds only 3.6 W more while costing 24% of bandwidth: a bad
-  trade for anything that is not pure GEMM.
-- At `eff` the memory clock makes no measurable difference; that profile is already at the
-  floor.
-- This needs the patched kernel module and a reboot, unlike the core profiles which are
-  runtime NVML calls. It is an option for a compute-bound deployment, not a default.
-  Decode-bound LLM serving should NOT use it; that workload wants every GB/s.
+An earlier revision of this section described underclocking the memory as a power lever that
+"needs a patched kernel module and a reboot", available only downward. That description predates
+the live BAR0 `hbm_mclk` tool this repo now ships (`170tune mclk-try`/`mclk-gate`), and is
+superseded by it: NDIV moves live, in both directions, with no reboot and no module rebuild. The
+underclock-for-power intuition (dropping memory clock on compute-bound work where HBM is
+over-provisioned trades a little bandwidth for a little power) is still directionally reasonable,
+but the production guidance in this repo is the opposite: raise NDIV to the gated ceiling (76 on
+the reference card) for the small compute/latency win it buys "for free" (see
+`docs/hbm-matrix.md`), and use the refresh lever above for power, since it costs measured
+retention margin rather than measured bandwidth and is the better-characterized trade for a
+decode-bound serving workload that wants every GB/s. Do not repeat the old underclock-for-power
+measurement without re-gating it on the current tooling; the old numbers were taken against a
+different (patched-module) mechanism and are not evidence about the live BAR0 path.
 
 ---
 
-## 7. Persistence and multi-card safety
+## 7. Persistence and multi-card safety (persist model corrected 2026-08-03)
 
-Offsets and power limits are volatile: lost on every driver reload and reboot. The
-`170hx-oc.service` systemd unit reapplies them at boot:
+Offsets, clock locks, and the HBM NDIV/timings/refresh writes are all volatile: lost on every
+driver reload and reboot. An earlier revision of this section described a per-profile
+`170hx-oc.service` unit (`ExecStart=170hx-oc eff`, `ExecStop=170hx-oc stock`) as the persistence
+mechanism. **That unit is retired.** It only ever covered the SM profile, it could not express an
+HBM point at all, and running it alongside the newer HBM persistence would have meant two units
+racing to apply state at boot. Persistence is now unified in `170tune` itself:
 
-- `Type=oneshot`, `RemainAfterExit=yes`
-- `After=nvidia-persistenced.service gen2-hammer.service`
-- `ExecStart=/usr/local/bin/170hx-oc eff`
-- `ExecStop=/usr/local/bin/170hx-oc stock`
-- Enable it on any host that runs a tuned card.
+```
+170tune persist save --offset 200 --clk 1400      # an SM point (needs a passing gate receipt)
+170tune persist save --profile eff                # or a named profile, resolved to numbers here
+170tune persist save --ndiv 76                     # an HBM point, combine or use alone
+170tune persist save --ndiv 76 --timings "REFRESH 24"   # HBM point + the refresh power lever
+170tune persist enable                             # installs + enables 170tune-persist.service
+170tune persist status                             # profile, service state, quarantine
+```
 
-Multi-card guard: the script guards on PCI device id 0x20C2 and loops over every GPU,
-because this host is a qualification bench and cards are swapped constantly. A non-170HX
-in the slot is skipped and logged, never overclocked. Each application logs to the journal
-with serial, offset and cap, for example:
+One conf per serial (`/var/lib/170tune/persist/<serial>.conf`), one systemd unit
+(`170tune-persist.service`, generated by `170tune` itself with the resolved tool paths baked in),
+applied by `170tune boot-apply` after the driver is up - the box always boots stock, so a bad
+profile is masked over ssh, never a brick. `persist save` for an SM point demands a gate receipt
+from THIS card (not quarantined, at least 4 hot sweeps, current memory clock, `-f`/`--force`
+overrides loudly); it also refuses outright if the driver's own memory clock is not genuinely
+stock (see the mclk misclassification guard in `170tune explain-hbm`).
+
+A box still running the old `170hx-oc.service` model is migrated automatically the next time
+`170tune install` runs: it reads the old `/etc/170tune/profile`, resolves it to an offset/ceiling,
+writes the new per-serial conf, disables the old unit FIRST and only then enables the new one (so
+a boot is never covered by both), renames the old conf to `.migrated`, and prints exactly what it
+did - never silently.
+
+Multi-card guard, unchanged in spirit: `170hx-oc` (still the SM profile applier `apply` hands off
+to for a live-now change) guards on both shipped 170HX device ids (0x20C2 8GB, 0x2082 10GB) and
+loops over every GPU, because this class of host is often a qualification bench where cards are
+swapped constantly. A non-170HX in a slot is skipped and logged, never touched. A persisted
+profile also records the serial it was qualified on (`OC_SERIAL`), so plugging in a second 170HX
+does not silently inherit the first card's unqualified overclock. Each application logs to the
+journal with serial, offset and cap, for example:
 
 ```
 170hx-oc: GPU 0 (1322621047793) profile=eff offset=+300 clk_max=1350 power_limit=300 W
@@ -499,15 +526,21 @@ with serial, offset and cap, for example:
 ## 8. Qualifying a NEW card
 
 Per-card silicon varies. +300 is validated on serial 1322621047793 only; do not assume it
-on another card. Ladder:
+on another card. For the SM side:
 
-1. `sudo nvml_oc` - confirm the GPC range is not `[0..0]` (the card is unlocked).
-2. `sudo 170hx-oc stock`, then `sudo oc_eff 10` for a baseline.
-3. Ladder +150 -> +300 with `oc_eff` at each step, then run `170hx-test.sh --no-unlock`
-   for the full-VRAM memory sweep and compute checksum at the candidate point.
-4. Stop at the first step that shows a device fault, and back off one FULL step, not one
-   bin.
-5. Record the result under `/var/lib/170tune/results/<serial>/` (170tune qualify does this).
+1. `sudo 170tune install`, `sudo 170tune preflight`, `sudo 170tune snapshot-stock` once, on the
+   new card/box (see the repo README's Setup section).
+2. `sudo nvml_oc` - confirm the GPC range is not `[0..0]` (the card is unlocked).
+3. `sudo 170hx-oc stock`, then `sudo oc_eff 10` for a baseline.
+4. `sudo 170tune ladder <clk>` (or `170tune qualify`) to walk the offset up, gating each rung
+   with the full-VRAM memory sweep and compute checksum - `170tune gate` does this for you; do
+   not stop at "it ran".
+5. Stop at the first step that shows a device fault, and back off one FULL step, not one bin.
+6. Record the result under `/var/lib/170tune/results/<serial>/` (`170tune qualify` does this),
+   then persist the point deliberately with `170tune persist save` (section 7 above).
+
+For the HBM side, the equivalent flow is `170tune mclk-ladder` / `170tune mclk-gate`, covered in
+full in `170tune explain-hbm` and `docs/hbm-matrix.md`.
 
 The gate is the pattern sweep, not "it ran". A silent corruptor (see the cliff in
 section 4) passes any test that only checks whether the kernel finished. Run 4 sweeps and
@@ -517,19 +550,54 @@ prefer margin over a number that looks equal on paper.
 
 ## 9. Tooling inventory
 
-- `tools/nvml_oc.c` -> `/usr/local/bin/nvml_oc [gpcMHz] [memMHz] [devIdx]`: query/apply
-  GPC and MEM VF offsets. The range query is the useful part (confirms unlock).
+SM (this guide):
+
+- `tools/nvml_oc.c` -> `/usr/local/bin/nvml_oc [-i idx] [gpcMHz] [memMHz] [devIdx]`: query/apply
+  GPC and MEM VF offsets. The range query is the useful part (confirms unlock). `-i` reads a
+  specific device on a multi-card host.
 - `tools/oc_eff.cu`: sustained bf16 GEMM with in-process NVML power sampling ->
   TFLOPS, W, GFLOPS/W.
-- `tools/oc_sweep.sh`: the offset x power-limit sweep that produced the sweep table.
-- `tools/oc_tune.sh <offset> <clk> [secs]`: fine-tune driver; writes
-  `analysis/oc_tune_sweep.csv`.
-- `tools/170hx-oc` + `tools/170hx-oc.service`: the profile applier and its boot unit.
-- `170hx-test.sh --no-unlock`: full-VRAM memory pattern sweep plus compute checksum (the
-  qualification gate).
-- `driver/0009-hbm-mclk-overclock.patch`: kernel-module patch used only to prove the mclk
-  clamp by measurement; not for production use.
-- `tools/fbpa_pll_dump.py`: FBPA PLL register dump used in the memory-clamp investigation.
+- `tools/170hx-oc`: the SM profile applier (`170tune apply` hands off to it); reads named
+  profiles or a per-card `custom <off> <clk>` point.
+- `tools/170hx-sweep` + `tools/gpu_selftest.cu`: the SM integrity gate - full-VRAM unique-pattern
+  write/verify plus a compute checksum, the one result line `170tune gate` parses.
+- `tools/compute_check.cu`: deterministic bf16 GEMM repeated and compared bit for bit; catches
+  silent COMPUTE corruption the memory sweep cannot see.
+- `tools/ctx_probe.cu`: the smallest proof the card is usable - create a context, allocate,
+  launch, read back. Catches the wedge `nvidia-smi` cannot see (170tune `status`/`recover` and
+  the HBM gate paths all call it).
+- `tools/mem_probe.cu`, `tools/gemm_probe.cu`: standalone streaming-bandwidth/latency and cublas
+  GEMM-throughput probes, used for the datatype table in section 1.
+- `tools/170hx-soak`: repeats a workload for hours and fails on any new Xid - what actually
+  decides whether a gated point can ship (see the soak findings in `docs/measurement-matrix.md`
+  and this file's safety section).
+
+HBM (see `170tune explain-hbm` and `docs/hbm-matrix.md` for the model these implement):
+
+- `tools/hbm_mclk.c`: live BAR0 control of the FBPA PLL (NDIV) - the memory clock lever. Set,
+  read, and the DDLL eye-recal escape hatch.
+- `tools/fbpa_regs.c`: live BAR0 control of the DRAM CONFIG timings and the CONFIG4 refresh
+  field. `dump`/`get`/`set`/`save`/`load`.
+- `tools/nvidia_bench.cu`: HBM bandwidth/latency bench (read/copy/triad, pointer-chase latency),
+  used by `170tune hbm-matrix` and the clock-moved proof in `mclk_verify` (bandwidth exceeding
+  the stock theoretical wall is the only thing `nvidia-smi` cannot fake).
+
+Boot/setup, all invoked through `170tune`, not run by hand:
+
+- `170tune install` (thin shim: `./install.sh`): builds every tool above from source and
+  installs them, this script, and `systemd/170tune-bootcheck.service`. Also runs the old-persist
+  migration (section 7).
+- `170tune preflight` / `170tune snapshot-stock`: read-only readiness checklist and the
+  per-card stock-value snapshot, for standing this up on a card whose VBIOS differs from the
+  reference card's hardcoded defaults.
+- `install_persist_unit` (inside `170tune`, not a separate script): generates
+  `/etc/systemd/system/170tune-persist.service` with the resolved tool paths baked in, so root
+  running the unit at boot does not need `find_tool`'s `$HOME`-guessing fallback to work.
+
+Retired: the earlier `170hx-oc.service` static unit (superseded by the unified persist above,
+migrated automatically), and the kernel-module patch this section used to reference to prove the
+memory-clock clamp by measurement - that finding was itself a wrong-write artifact, corrected in
+section 6; the tooling above supersedes it entirely.
 
 ---
 

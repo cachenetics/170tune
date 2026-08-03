@@ -1,7 +1,7 @@
 [Unit]
 Description=Revert 170HX tuning if the last run did not check in before the machine went down
 After=nvidia-persistenced.service
-Before=170hx-oc.service
+Before=170tune-persist.service
 Wants=nvidia-persistenced.service
 
 [Service]
