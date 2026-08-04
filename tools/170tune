@@ -184,7 +184,7 @@ quarantine_file() { printf '%s/quarantine/%s/off%s_clk%s.json' "$STATE" "$(seria
 cmd_quarantine() {
     need_root quarantine "$@"
     if [ "${1:-}" = "list" ]; then
-        local d="$STATE/quarantine/$(serial)"
+        local d; d="$STATE/quarantine/$(serial)"
         [ -d "$d" ] || { say "no quarantined points on card $(serial)"; return 0; }
         say "${c_hi}quarantined on card $(serial):${c_off}"
         local f
