@@ -823,9 +823,15 @@ mclk_source() {
     if [ "$smi_mclk" != "$stock_mhz" ] 2>/dev/null; then
         printf 'driver-baked (unsupported for tuning)'; return 0
     fi
+    # Read the live NDIV DIRECTLY (not via cur_ndiv, which defaults to STOCK_NDIV on failure): a
+    # register we could not read is NOT a stock register. hbm_mclk needs root to mmap BAR0, so a
+    # non-root `status` lands here - say so instead of falsely reporting 'stock' on an OC'd card.
     live_ndiv=""
-    [ -x "$HBM_MCLK" ] && live_ndiv=$(cur_ndiv 2>/dev/null)
-    if [ -n "$live_ndiv" ] && [ "$live_ndiv" != "$STOCK_NDIV" ]; then
+    [ -x "$HBM_MCLK" ] && live_ndiv=$("$HBM_MCLK" get 2>/dev/null | grep -oE 'NDIV [0-9]+' | grep -oE '[0-9]+' | head -1)
+    if [ -z "$live_ndiv" ]; then
+        printf 'unknown - run as root to read the PLL'; return 1
+    fi
+    if [ "$live_ndiv" != "$STOCK_NDIV" ]; then
         printf 'userspace (NDIV %s)' "$live_ndiv"; return 0
     fi
     printf 'stock'; return 0
