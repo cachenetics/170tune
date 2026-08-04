@@ -62,6 +62,10 @@ STOCK_NDIV=${STOCK_NDIV:-64}                    # this card's VBIOS stock NDIV (
 STOCK_REFRESH=${STOCK_REFRESH:-6}               # stock CONFIG4 REFRESH field (~3.9us at 1728); refresh revert target
 STOCK_WALL=${STOCK_WALL:-1769}                  # GB/s theoretical peak at stock NDIV - the >wall clock-moved anchor
 TRIAD=${TRIAD:-$(find_tool /usr/local/bin/hbm_triad "$(user_home)/170hx/tools/hbm_triad" "$HOME/170hx/tools/hbm_triad")}
+# hbm-matrix uses these two directly: nvidia_bench (--csv: read/write/copy/triad/d2d/lat) and
+# mem_probe (the peak streaming read + dependent-load latency). Both are built by 'install'.
+NVBENCH=${NVBENCH:-$(find_tool /usr/local/bin/nvidia_bench "$(user_home)/170hx/tools/nvidia_bench" "$HOME/170hx/tools/nvidia_bench")}
+MEMPROBE=${MEMPROBE:-$(find_tool /usr/local/bin/mem_probe "$(user_home)/170hx/tools/mem_probe" "$HOME/170hx/tools/mem_probe")}
 MEASURE_TIMEOUT=${MEASURE_TIMEOUT:-180}
 GATE_TEMP=${GATE_TEMP:-60}      # soak until HBM reaches this many C - gate HOT, never cold
 GATE_SOAK_MAX=${GATE_SOAK_MAX:-180}  # give up soaking after this many seconds
@@ -1110,38 +1114,69 @@ cmd_hbm_matrix() {
     local start=${1:-64} step=${2:-2} max=${3:-78}
     is_170hx || die "refusing: GPU 0 is not a 170HX"
     [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
-    [ -x "$TRIAD" ] || die "no bandwidth tool - set TRIAD=/path (e.g. nvidia_bench)"
-    local s csv; s=$(serial); mkdir -p "$STATE"; csv="$STATE/hbm_matrix_${s}.csv"
-    [ -f "$csv" ] || echo "utc,ndiv,mhz,read_gbs,copy_gbs,triad_gbs,lat_ns,power_w,moved" > "$csv"
+    [ -x "$MEMPROBE" ] || die "mem_probe not found at $MEMPROBE (run '170tune install')"
+    [ -x "$NVBENCH" ]  || die "nvidia_bench not found at $NVBENCH (run '170tune install')"
+    local s csv hdr; s=$(serial); mkdir -p "$STATE"; csv="$STATE/hbm_matrix_${s}.csv"
+    hdr="utc,ndiv,mhz,peak_gbs,read_gbs,pct_peak,triad_gbs,copy_gbs,write_gbs,d2d_gbs,nvbench_read_gbs,lat_ns,power_w,gbs_per_w,mem_c,core_c,delta_stock_pct,moved"
+    # A CSV from an older, narrower schema would otherwise get new wide rows appended under a stale
+    # header. Rotate it so the file is never mixed-schema; a fresh run then writes the current header.
+    [ -f "$csv" ] && [ "$(head -1 "$csv" 2>/dev/null)" != "$hdr" ] && mv "$csv" "${csv}.$(date -u +%Y%m%dT%H%M%SZ).bak" 2>/dev/null
+    [ -f "$csv" ] || echo "$hdr" > "$csv"
     say "${c_hi}HBM matrix - card $s (NDIV $start..$max step $step)${c_off}"
-    say "${c_warn}UNVERIFIED: a row is delivered bandwidth/latency, not safety. Only mclk-gate / mclk-ladder"
-    say "qualify an NDIV. READ/COPY/TRIAD GB/s, LAT ns (pointer-chase), PWR W. Raw rows: $csv${c_off}"
-    printf '%-5s %-6s %9s %9s %9s %8s %7s  %s\n' "NDIV" "MHz" "READ" "COPY" "TRIAD" "LAT_ns" "PWR_W" "moved?"
-    local ndiv=$start
+    say "${c_warn}UNVERIFIED: a row is delivered bandwidth/latency, not safety - only mclk-gate / mclk-ladder"
+    say "qualify an NDIV. READ = mem_probe peak read; TRIAD/COPY/D2D = nvidia_bench; LAT = dependent-load (ns)."
+    say "PWR/MEMC sampled hot; GB/s/W = read/watt; dSTOCK = read vs stock; MOVED = read past the ${STOCK_WALL} GB/s"
+    say "stock wall (the clock-moved proof - nvidia-smi is blind to a userspace NDIV). Raw rows: $csv${c_off}"
+    printf '%-4s %-5s %6s %7s %5s %7s %7s %7s %7s %6s %7s %5s %7s %s\n' \
+        NDIV MHz PEAK READ %PK TRIAD COPY D2D LAT_ns PWR_W GB/s/W MEMC dSTOCK MOVED
+    local ndiv=$start stock_read=""
     while [ "$ndiv" -le "$max" ]; do
         if [ "$ndiv" = "$STOCK_NDIV" ]; then mclk_revert
         elif ! "$HBM_MCLK" set "$ndiv" >/dev/null 2>&1; then
-            printf '%-5s %-6s %9s  %s\n' "$ndiv" "$((ndiv * 27))" "-" "did not lock"
-            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$ndiv,$((ndiv * 27)),,,,,,nolock" >> "$csv"
+            printf '%-4s %-5s %6s  %s\n' "$ndiv" "$((ndiv * 27))" "-" "did not lock"
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$ndiv,$((ndiv * 27)),,,,,,,,,,,,,,,nolock" >> "$csv"
             ndiv=$((ndiv + step)); continue
         fi
         sleep 1
-        local line rd cp tr lat pw moved
-        line=$("$TRIAD" --csv 2>/dev/null | tail -1)
-        lat=$(printf '%s' "$line" | awk -F, '{print $13}')
-        rd=$(printf '%s' "$line" | awk -F, '{print $14}')
-        cp=$(printf '%s' "$line" | awk -F, '{print $16}')
-        tr=$(printf '%s' "$line" | awk -F, '{print $17}')
-        pw=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-        moved="-"; awk -v t="${tr:-0}" -v w="$STOCK_WALL" 'BEGIN{exit !(t>w)}' && moved="yes"
-        printf '%-5s %-6s %9s %9s %9s %8s %7s  %s\n' "$ndiv" "$((ndiv * 27))" "${rd:-?}" "${cp:-?}" "${tr:-?}" "${lat:-?}" "${pw:-?}" "$moved"
-        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$ndiv,$((ndiv * 27)),${rd:-},${cp:-},${tr:-},${lat:-},${pw:-},$moved" >> "$csv"
+        # mem_probe: the peak streaming read (the headline number) + dependent-load latency
+        local mpout mpread mplat
+        mpout=$(timeout "$MEASURE_TIMEOUT" "$MEMPROBE" 2>/dev/null)
+        mpread=$(printf '%s' "$mpout" | grep -oE 'read_bw = [0-9.]+' | grep -oE '[0-9.]+')
+        mplat=$(printf '%s' "$mpout" | grep -oE 'dram_latency = [0-9.]+' | grep -oE '[0-9.]+' | head -1)
+        # nvidia_bench --csv: STREAM read/write/copy/triad + cudaMemcpy D2D (fields 14/15/16/17/18)
+        local line nvread nvwrite cp tr d2d
+        line=$(timeout "$MEASURE_TIMEOUT" "$NVBENCH" --csv 2>/dev/null | tail -1)
+        nvread=$(printf  '%s' "$line" | awk -F, '{print $14}')
+        nvwrite=$(printf '%s' "$line" | awk -F, '{print $15}')
+        cp=$(printf      '%s' "$line" | awk -F, '{print $16}')
+        tr=$(printf      '%s' "$line" | awk -F, '{print $17}')
+        d2d=$(printf     '%s' "$line" | awk -F, '{print $18}')
+        # power + temps sampled hot, immediately after the load
+        local pw memc corec
+        pw=$(nvidia-smi   --query-gpu=power.draw          --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        memc=$(nvidia-smi --query-gpu=temperature.memory  --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        corec=$(nvidia-smi --query-gpu=temperature.gpu    --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        [ "$ndiv" = "$STOCK_NDIV" ] && stock_read=${mpread:-}
+        # derive theoretical peak, % of peak, read-per-watt, delta vs stock, and the clock-moved flag
+        local mhz=$((ndiv * 27)) peak pct gw dpct moved
+        read -r peak pct gw dpct moved < <(awk -v r="${mpread:-0}" -v mhz="$mhz" -v pw="${pw:-0}" \
+            -v sr="${stock_read:-0}" -v wall="$STOCK_WALL" 'BEGIN{
+                peak=mhz*1.024;
+                printf "%.0f ", peak;
+                printf "%s ",  (peak>0 ? sprintf("%.1f",  100*r/peak)      : "-");
+                printf "%s ",  (pw>0   ? sprintf("%.1f",  r/pw)            : "-");
+                printf "%s ",  (sr>0   ? sprintf("%+.1f", 100*(r-sr)/sr)   : "-");
+                printf "%s",   (r>wall ? "yes" : "-"); }')
+        printf '%-4s %-5s %6s %7s %5s %7s %7s %7s %7s %6s %7s %5s %7s %s\n' \
+            "$ndiv" "$mhz" "$peak" "${mpread:-?}" "$pct" "${tr:-?}" "${cp:-?}" "${d2d:-?}" "${mplat:-?}" "${pw:-?}" "$gw" "${memc:-?}" "$dpct" "$moved"
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$ndiv,$mhz,$peak,${mpread:-},$pct,${tr:-},${cp:-},${nvwrite:-},${d2d:-},${nvread:-},${mplat:-},${pw:-},$gw,${memc:-},${corec:-},$dpct,$moved" >> "$csv"
         ndiv=$((ndiv + step))
     done
     mclk_revert
     say "${c_ok}matrix done; card reverted to stock NDIV $STOCK_NDIV. Rows appended to $csv${c_off}"
-    say "extremes: max READ = highest stable NDIV; min LAT_ns = tightest timings; balance = read/watt."
-    say "the >stock-wall (${STOCK_WALL} GB/s) 'moved' column is the clock proof - nvidia-smi is blind."
+    say "READ (mem_probe peak) is the headline; TRIAD (read+write) is the decode proxy; LAT is dependent-load."
+    say "MOVED past the ${STOCK_WALL} GB/s stock wall is the clock-moved proof - a read above it is impossible"
+    say "unless the DRAM clock actually rose, which is the one thing nvidia-smi cannot show."
 }
 
 cmd_timings() {

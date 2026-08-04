@@ -137,7 +137,7 @@ budget, and loosening only adds latency. So production keeps stock timings.
 
 | Profile | Setting | Gain vs stock | Notes |
 |---|---|---|---|
-| **Robust (default)** | NDIV 76, stock timings, stock refresh | ~+16% triad / +13% read / -5% latency | gated 12/12 hot on any thermal |
+| **Robust (default)** | NDIV 76, stock timings, stock refresh | ~+20% triad / +18% peak read / -3% latency | gated 12/12 hot on any thermal |
 | **Power-optimized** | NDIV 76, stock timings, refresh field 24 | above, plus ~-14% power | ~16x inside the measured retention margin; keep HBM in normal thermals |
 | **Ultra-conservative** | NDIV 75 | near-identical performance | one extra step of guardband |
 
