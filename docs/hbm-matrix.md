@@ -53,7 +53,7 @@ setting, so the grid is the shipped config, not a synthetic one. Columns:
 
 The 64-76 rows are a single hot `170tune hbm-matrix 64 2 76` sweep (mem 60-71C, shown per row). 77
 and 78 are NOT bandwidth-swept: bare NDIV 77 hard-hangs the controller (a row timing crosses its
-floor - see the ceilings below), so the matrix stops at the robust ceiling; their triad figures are
+floor - see the ceilings below), so the matrix stops at 76 (the pattern-sweep ceiling); their triad figures are
 from the separate command-tuned ceiling hunt.
 
 vs the fully-stock baseline, NDIV 76 (at REFRESH 24): **read +18.9%, triad +19.9%, copy +23.2%,

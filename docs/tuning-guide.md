@@ -466,11 +466,11 @@ the live BAR0 `hbm_mclk` tool this repo now ships (`170tune mclk-try`/`mclk-gate
 superseded by it: NDIV moves live, in both directions, with no reboot and no module rebuild. The
 underclock-for-power intuition (dropping memory clock on compute-bound work where HBM is
 over-provisioned trades a little bandwidth for a little power) is still directionally reasonable,
-but the production guidance in this repo is the opposite: raise NDIV to the gated ceiling (76 on
-the reference card) for the small compute/latency win it buys "for free" (see
-`docs/hbm-matrix.md`), and use the refresh lever above for power, since it costs measured
-retention margin rather than measured bandwidth and is the better-characterized trade for a
-decode-bound serving workload that wants every GB/s. Do not repeat the old underclock-for-power
+but the production guidance in this repo is the opposite: raise NDIV to the SERVING ceiling (NDIV 70
+on the reference card - the pattern-sweep gate passes to 76, but 72 corrupts and 74-76 crash under a
+real workload, see the serving subsection below) for the small margin it gives a bandwidth-bound
+workload (it buys ~0 for decode, which is not bandwidth-bound), and use the refresh lever above for
+power, since it costs measured retention margin rather than measured bandwidth. Do not repeat the old underclock-for-power
 measurement without re-gating it on the current tooling; the old numbers were taken against a
 different (patched-module) mechanism and are not evidence about the live BAR0 path.
 
@@ -568,8 +568,7 @@ racing to apply state at boot. Persistence is now unified in `170tune` itself:
 ```
 170tune persist save --offset 200 --clk 1400      # an SM point (needs a passing gate receipt)
 170tune persist save --profile eff                # or a named profile, resolved to numbers here
-170tune persist save --ndiv 76                     # an HBM point, combine or use alone
-170tune persist save --ndiv 76 --timings "REFRESH 24"   # HBM point + the refresh power lever
+170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable HBM point (70 is the serving ceiling, not 76)
 170tune persist enable                             # installs + enables 170tune-persist.service
 170tune persist status                             # profile, service state, quarantine
 ```

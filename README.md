@@ -34,10 +34,17 @@ sudo ./install.sh            # build the helper tools from source, install to /u
 sudo 170tune preflight       # check the card, driver, stock mclk, iomem access, the unlock
 sudo 170tune snapshot-stock  # record THIS card's stock values as its revert baseline (once)
 
-sudo 170tune mclk-gate 76 12         # prove NDIV 76 on THIS card: 12 hot sweeps + compute
-sudo 170tune persist save --ndiv 76  # save the robust default profile
-sudo 170tune persist enable          # re-apply it after every boot (the card still boots stock)
+sudo 170tune mclk-gate 70 12                        # prove NDIV 70 on THIS card: 12 hot sweeps + compute
+sudo 170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable profile
+sudo 170tune persist enable                         # re-apply it after every boot (the card still boots stock)
 ```
+
+**Why NDIV 70, not higher?** The pattern-sweep gate (`mclk-gate`) passes up to NDIV 76, but that is a
+memory-only test run cool. Under a real inference workload only **NDIV 70 is stable**: 72 silently
+corrupts as the HBM heats past ~75C, and 74-76 crash outright (76 is a read-eye wall - it wedges on
+the first serving load even started cool). So gate under YOUR real workload before shipping any OC
+NDIV, and drive the GPU fan from HBM temp when you do. Higher NDIV is peak *synthetic* bandwidth
+only - and note single-stream decode is not bandwidth-bound, so even the stable OC buys ~0 there.
 
 Before turning knobs by hand, read the levers: `170tune explain` (SM) and `170tune explain-hbm`
 (HBM). Every number in this repo is from one reference card - `qualify` and `mclk-ladder` on your
@@ -130,18 +137,20 @@ The canonical grid, ceilings, and tested non-levers are in [`docs/hbm-matrix.md`
 
 ## Production profiles
 
-The only change from stock that pays is the clock. Raising NDIV already tightens every timing in
-nanoseconds for free (real time = cycles / clock), so stock timings at NDIV 76 are both valid and
-maximally margined: tightening buys nothing measurable and spends the silent-corruption safety
-budget, and loosening only adds latency. So production keeps stock timings.
+Keep STOCK timings (raising NDIV already tightens every timing in ns for free; tighter spends the
+silent-corruption budget, looser only adds latency). The profile that matters is the CLOCK, and the
+right clock depends on whether you are SERVING or benchmarking:
 
 | Profile | Setting | Gain vs stock | Notes |
 |---|---|---|---|
-| **Robust (default)** | NDIV 76, stock timings, stock refresh | ~+20% triad / +19% peak read / -3% latency | gated 12/12 hot on any thermal |
-| **Power-optimized** | NDIV 76, stock timings, refresh field 24 | above, plus ~-14% power | ~16x inside the measured retention margin; keep HBM in normal thermals |
-| **Ultra-conservative** | NDIV 75 | near-identical performance | one extra step of guardband |
+| **Serving (default)** | **NDIV 70**, stock timings, REFRESH 24, GPU fan on HBM temp | +10% read; ~0 for decode | The validated serving ceiling - held flawlessly (0 Xids) under sustained single-stream + concurrent load, HBM <=76C. The fan (`gpu-fan-curve`) is REQUIRED. |
+| **Bench / synthetic-only** | up to NDIV 76 | +19% peak read | Pattern-sweep ceiling for a memory-bound benchmark. **Not serving-safe**: 72 corrupts as it heats, 74-76 crash. Gate under YOUR real workload before trusting it. |
+| **Ultra-conservative** | NDIV 68 | near-identical | one step of guardband below the serving ceiling |
 
-Prove the point on the card, then persist it (below).
+**The pattern-sweep gate (`mclk-gate`) is necessary but NOT sufficient for serving** - it is
+memory-only and cool. NDIV 76 gates 12/12 yet wedges on the first real inference load. Always add a
+real-workload rung (see the [`hbm-matrix.md`](docs/hbm-matrix.md) serving caveat and the tuning
+guide's "Memory OC under a REAL serving workload"). Prove the point on the card, then persist (below).
 
 ## Persist across reboots
 
@@ -154,8 +163,8 @@ mid-apply), it stays stock rather than re-applying a possibly-bad point.
 170tune gate 200 1400 4 --workload /usr/local/bin/vllm_workload_check.sh
 170tune persist save --offset 200 --clk 1400   # refuses without a passing receipt (-f overrides)
 170tune persist save --profile eff             # or: a named profile, resolved at save time
-170tune mclk-gate 76 12                         # prove the HBM point on THIS card, hot
-170tune persist save --ndiv 76                  # combine with the SM save above, or alone
+170tune mclk-gate 70 12                         # prove the HBM point on THIS card, hot (then gate under a real workload)
+170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable HBM point; combine with the SM save above, or alone
 170tune persist enable                          # install + enable the boot service
 170tune persist status                          # show the profile and service state
 ```
