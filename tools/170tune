@@ -66,6 +66,9 @@ TRIAD=${TRIAD:-$(find_tool /usr/local/bin/hbm_triad "$(user_home)/170hx/tools/hb
 # mem_probe (the peak streaming read + dependent-load latency). Both are built by 'install'.
 NVBENCH=${NVBENCH:-$(find_tool /usr/local/bin/nvidia_bench "$(user_home)/170hx/tools/nvidia_bench" "$HOME/170hx/tools/nvidia_bench")}
 MEMPROBE=${MEMPROBE:-$(find_tool /usr/local/bin/mem_probe "$(user_home)/170hx/tools/mem_probe" "$HOME/170hx/tools/mem_probe")}
+# hbm-matrix measures every OVERCLOCKED rung at the power-optimized ship refresh (field 24); the
+# stock NDIV row stays at stock refresh so the baseline is honestly fully-stock. Override if needed.
+HBM_MATRIX_REFRESH=${HBM_MATRIX_REFRESH:-24}
 MEASURE_TIMEOUT=${MEASURE_TIMEOUT:-180}
 GATE_TEMP=${GATE_TEMP:-60}      # soak until HBM reaches this many C - gate HOT, never cold
 GATE_SOAK_MAX=${GATE_SOAK_MAX:-180}  # give up soaking after this many seconds
@@ -1125,25 +1128,48 @@ cmd_hbm_matrix() {
     say "${c_hi}HBM matrix - card $s (NDIV $start..$max step $step)${c_off}"
     say "${c_warn}UNVERIFIED: a row is delivered bandwidth/latency, not safety - only mclk-gate / mclk-ladder"
     say "qualify an NDIV. READ = mem_probe peak read; TRIAD/COPY/D2D = nvidia_bench; LAT = dependent-load (ns)."
-    say "PWR/MEMC sampled hot; GB/s/W = read/watt; dSTOCK = read vs stock; MOVED = read past the ${STOCK_WALL} GB/s"
-    say "stock wall (the clock-moved proof - nvidia-smi is blind to a userspace NDIV). Raw rows: $csv${c_off}"
+    say "OC rows are measured at REFRESH ${HBM_MATRIX_REFRESH} (the power-optimized ship setting); the stock NDIV"
+    say "$STOCK_NDIV row stays fully stock (REFRESH ${STOCK_REFRESH}). PWR is MEAN board draw sampled DURING the read"
+    say "load; GB/s/W = read/watt; dSTOCK = read vs stock; MOVED = read past the ${STOCK_WALL} GB/s stock wall (the"
+    say "clock-moved proof - nvidia-smi is blind to a userspace NDIV). Raw rows: $csv${c_off}"
     printf '%-4s %-5s %6s %7s %5s %7s %7s %7s %7s %6s %7s %5s %7s %s\n' \
         NDIV MHz PEAK READ %PK TRIAD COPY D2D LAT_ns PWR_W GB/s/W MEMC dSTOCK MOVED
     local ndiv=$start stock_read=""
     while [ "$ndiv" -le "$max" ]; do
-        if [ "$ndiv" = "$STOCK_NDIV" ]; then mclk_revert
+        local rrefresh=$HBM_MATRIX_REFRESH
+        if [ "$ndiv" = "$STOCK_NDIV" ]; then mclk_revert; rrefresh=$STOCK_REFRESH
         elif ! "$HBM_MCLK" set "$ndiv" >/dev/null 2>&1; then
             printf '%-4s %-5s %6s  %s\n' "$ndiv" "$((ndiv * 27))" "-" "did not lock"
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$ndiv,$((ndiv * 27)),,,,,,,,,,,,,,,nolock" >> "$csv"
             ndiv=$((ndiv + step)); continue
         fi
+        # OC rungs run at the ship refresh; the stock NDIV row stays at stock refresh (honest baseline)
+        [ -x "$FBPA_REGS" ] && "$FBPA_REGS" set REFRESH "$rrefresh" >/dev/null 2>&1
         sleep 1
-        # mem_probe: the peak streaming read (the headline number) + dependent-load latency
-        local mpout mpread mplat
-        mpout=$(timeout "$MEASURE_TIMEOUT" "$MEMPROBE" 2>/dev/null)
-        mpread=$(printf '%s' "$mpout" | grep -oE 'read_bw = [0-9.]+' | grep -oE '[0-9.]+')
-        mplat=$(printf '%s' "$mpout" | grep -oE 'dram_latency = [0-9.]+' | grep -oE '[0-9.]+' | head -1)
-        # nvidia_bench --csv: STREAM read/write/copy/triad + cudaMemcpy D2D (fields 14/15/16/17/18)
+        # mem_probe = the peak streaming read + dependent-load latency. Sample board power WHILE it
+        # runs (a pure read load); do NOT sample after nvidia_bench, whose trailing compute phase
+        # (bf16/int8 tensor, ~200 TFLOPS) would dominate a post-hoc reading and overstate HBM power.
+        local mptmp mpread mplat pw memc corec p mppid
+        mptmp=$(mktemp 2>/dev/null) || mptmp="$STATE/.mp.$$"
+        timeout "$MEASURE_TIMEOUT" "$MEMPROBE" >"$mptmp" 2>/dev/null &
+        mppid=$!; local psum=0 pn=0
+        while kill -0 "$mppid" 2>/dev/null; do
+            p=$(nvidia-smi    --query-gpu=power.draw         --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            case "$p" in ''|*[!0-9.]*) : ;; *) psum=$(awk -v s="$psum" -v x="$p" 'BEGIN{print s+x}'); pn=$((pn+1)) ;; esac
+            memc=$(nvidia-smi --query-gpu=temperature.memory --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            corec=$(nvidia-smi --query-gpu=temperature.gpu   --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            sleep 1
+        done
+        wait "$mppid" 2>/dev/null
+        # MEAN board draw across the read load, not peak - a pure read spikes, and the mean is the
+        # representative steady figure, comparable to the sustained-load numbers elsewhere in the docs.
+        pw=$(awk -v s="$psum" -v n="$pn" 'BEGIN{ if(n>0) printf "%.1f", s/n; else print "" }')
+        [ -n "$pw" ] || pw=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        mpread=$(grep -oE 'read_bw = [0-9.]+' "$mptmp" | grep -oE '[0-9.]+')
+        mplat=$(grep -oE 'dram_latency = [0-9.]+' "$mptmp" | grep -oE '[0-9.]+' | head -1)
+        rm -f "$mptmp"
+        # nvidia_bench --csv: STREAM read/write/copy/triad + cudaMemcpy D2D (fields 14/15/16/17/18);
+        # its compute-TFLOPS tail is ignored - we read only the bandwidth columns.
         local line nvread nvwrite cp tr d2d
         line=$(timeout "$MEASURE_TIMEOUT" "$NVBENCH" --csv 2>/dev/null | tail -1)
         nvread=$(printf  '%s' "$line" | awk -F, '{print $14}')
@@ -1151,11 +1177,6 @@ cmd_hbm_matrix() {
         cp=$(printf      '%s' "$line" | awk -F, '{print $16}')
         tr=$(printf      '%s' "$line" | awk -F, '{print $17}')
         d2d=$(printf     '%s' "$line" | awk -F, '{print $18}')
-        # power + temps sampled hot, immediately after the load
-        local pw memc corec
-        pw=$(nvidia-smi   --query-gpu=power.draw          --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-        memc=$(nvidia-smi --query-gpu=temperature.memory  --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-        corec=$(nvidia-smi --query-gpu=temperature.gpu    --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
         [ "$ndiv" = "$STOCK_NDIV" ] && stock_read=${mpread:-}
         # derive theoretical peak, % of peak, read-per-watt, delta vs stock, and the clock-moved flag
         local mhz=$((ndiv * 27)) peak pct gw dpct moved
@@ -1173,8 +1194,10 @@ cmd_hbm_matrix() {
         ndiv=$((ndiv + step))
     done
     mclk_revert
-    say "${c_ok}matrix done; card reverted to stock NDIV $STOCK_NDIV. Rows appended to $csv${c_off}"
+    [ -x "$FBPA_REGS" ] && "$FBPA_REGS" set REFRESH "$STOCK_REFRESH" >/dev/null 2>&1
+    say "${c_ok}matrix done; card reverted to stock (NDIV $STOCK_NDIV, REFRESH $STOCK_REFRESH). Rows appended to $csv${c_off}"
     say "READ (mem_probe peak) is the headline; TRIAD (read+write) is the decode proxy; LAT is dependent-load."
+    say "PWR is mean draw sampled during the read load, at REFRESH ${HBM_MATRIX_REFRESH} for the OC rows."
     say "MOVED past the ${STOCK_WALL} GB/s stock wall is the clock-moved proof - a read above it is impossible"
     say "unless the DRAM clock actually rose, which is the one thing nvidia-smi cannot show."
 }
