@@ -304,6 +304,8 @@ tools/setup-vllm-170hx.sh     stand vLLM up on a 170HX from scratch; refuses ten
 docs/tuning-guide.md          the long-form SM findings
 docs/measurement-matrix.md    the full SM offset x clock-ceiling measurement matrix
 docs/hbm-matrix.md            the canonical HBM tuning matrix: NDIV grid, ceilings, refresh lever
+docs/hbm-timing-understanding.md  the mechanistic HBM model: per-field ns floors and which timing
+                          binds as NDIV rises (the "why" behind the matrix)
 install.sh                the thin shim for 'tools/170tune install'
 ```
 
