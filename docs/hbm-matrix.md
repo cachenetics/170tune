@@ -108,6 +108,15 @@ more frequent = better retention, more power, less bandwidth; larger = the rever
 
 ## Production profile
 
+> **SERVING CAVEAT (2026-08-04): these NDIV points are qualified by the hot PATTERN SWEEP, which is
+> memory-only and runs the HBM at 60-71C. Under a real inference workload the HBM reaches ~90C and
+> the read eye fails: NDIV 76 CRASHES vLLM serving (Xid 45) within minutes, NDIV 72 corrupts and
+> degrades. So the profiles below are pattern-sweep-qualified, NOT serving-qualified. Before running
+> any OC NDIV under a serving workload, keep the GPU fan driven by HBM temp (`gpu-fan-curve`) and
+> run a real workload rung to thermal soak - and note that even when stable, the memory OC gives ~0
+> decode gain (single-stream decode is not bandwidth-bound). See `docs/tuning-guide.md`, "Memory OC
+> under a REAL serving workload".**
+
 The only change from stock that pays is the CLOCK. Raising NDIV already tightens every timing in ns
 for free (ns = cycles/clock), so stock cycle counts at 76 are both valid (12/12) and maximally
 margined - tighter buys nothing measurable and spends the silent-corruption safety budget; looser
