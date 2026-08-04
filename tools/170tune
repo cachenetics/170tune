@@ -740,11 +740,11 @@ cmd_recover() {
         say "  (the state where torch reports device_count()=1 with is_available()=False)"
         say "${c_warn}  going straight to a driver reload - clearing offsets cannot fix this${c_off}"
     fi
-    systemctl stop nvidia-persistenced gpu-fan-curve 2>/dev/null
+    systemctl stop nvidia-persistenced 2>/dev/null
     fuser -k /dev/nvidia* 2>/dev/null
     modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>&1 | head -2
     modprobe nvidia 2>&1 | head -2
-    systemctl start nvidia-persistenced gpu-fan-curve 2>/dev/null
+    systemctl start nvidia-persistenced 2>/dev/null
     sleep 3
     if ! wedged && ! ctx_dead; then say "${c_ok}driver reload recovered it${c_off}"; return 0; fi
     if ! wedged; then

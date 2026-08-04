@@ -5,8 +5,9 @@ the three ceilings and their mechanisms, the refresh power lever, what is NOT a 
 profile, and the corrected phantom conclusions. Card 1322621047793 (GA100, 8 active FBPAs /
 4096-bit HBM2e, driver 610.43.03 patched unlock). All tuning is live userspace BAR0 (`hbm_mclk` sets
 the HBM PLL NDIV, `fbpa_regs` sets the CONFIG timings); the card always boots stock. Tool: `170tune`
-(`explain-hbm` for the model, `mclk-gate`/`refresh`/`persist` to apply). Supersedes the scattered
-`hbm_*` docs in this directory; `hbm_timing_understanding.md` holds the mechanistic detail.
+(`explain-hbm` for the model, `mclk-gate`/`refresh`/`persist` to apply). This file is the grid and
+the ship points; the mechanistic model - the per-field ns constraint structure and which timing
+binds as NDIV rises - is in [`hbm-timing-understanding.md`](hbm-timing-understanding.md).
 
 ## The grid (stock timings, clean measurement, gpu_selftest hot-gate)
 

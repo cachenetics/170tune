@@ -8,11 +8,10 @@ Reference card: serial 1322621047793 (GA100, 70 SM, 64 GB HBM2e unlocked, driver
 numbers below were measured on this card unless stated otherwise. Per-card silicon
 varies; see "Qualifying a new card" before you trust any offset on a different serial.
 
-Consolidated from:
-- `analysis/oc_efficiency_2026-07-27.md` (the core OC story)
-- `analysis/oc_matrix.md` (the full offset x clock-ceiling matrix)
-- `analysis/hbm_mclk_oc_measured_2026-07-27.md` (why memory OC is closed)
-- `analysis/fwsec_bar0_aperture_correction_2026-07-26.md` (FWSEC BAR0 aperture; Gen3 line)
+This is the distilled SM tuning record: the core OC story and the full offset x clock-ceiling
+matrix, consolidated into one shippable guide. The per-experiment raw analysis it draws on lives in
+the separate cmp170hx research repo. For the HBM side see
+[`hbm-matrix.md`](hbm-matrix.md) and [`hbm-timing-understanding.md`](hbm-timing-understanding.md).
 
 ---
 
@@ -603,8 +602,8 @@ section 6; the tooling above supersedes it entirely.
 
 ## 10. Background: FWSEC BAR0 aperture and the Gen3 line
 
-This is context for the separate Gen3-unlock effort, not part of tuning; full detail in
-`analysis/fwsec_bar0_aperture_correction_2026-07-26.md`.
+This is context for the separate Gen3-unlock effort, not part of tuning, and none of it affects a
+tuning result above. Full detail lives with the link-training work, not in this repo.
 
 Every `0x14xx....` constant in the FWSEC falcon code is a BAR0 offset OR'd with the
 aperture base `0x14000000`, not a Falcon-private address. So e.g. `0x14118F78` is BAR0
