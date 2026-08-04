@@ -488,15 +488,25 @@ reference card serving Qwen3.6-27B INT8 (MTP, num_spec=1) under vLLM, single-str
 | stock NDIV 64        | 38.9 -> 36.6 -> 32.6 -> 38.3 tok/s (recovers)| throttles, SELF-HEALS   |
 | NDIV 72 (uncooled)   | 29 -> 21 -> 20 tok/s, HBM 80->87->91C         | corrupts, then WEDGES   |
 | NDIV 72 (fan maxed)  | 37.9 -> 30.5 -> 28.7 -> 25.8, HBM 67->80C     | corrupts (no wedge)     |
-| NDIV 76              | crashes in <3min: Xid 45 launch failure       | UNSERVABLE              |
+| NDIV 76 (cool start) | 22 tok/s + 4 Xids on the FIRST load at 56C    | UNSERVABLE (eye, not heat)|
 +----------------------+----------------------------------------------+-------------------------+
 ```
+
+76 and 72 fail DIFFERENTLY, and the distinction is the whole point:
+- **NDIV 76 is an EYE wall, temperature-independent.** With the fan curve active and the card started
+  cool (56C), 76 still threw 4 Xids and wedged on the very FIRST serving bench - it never got hot.
+  The read eye at 2052 MHz simply cannot sample under the serving access pattern (attention/KV + GSP
+  concurrency), cool or not. Cooling does not help 76.
+- **NDIV 72 is a THERMAL wall.** It serves fine cool (37.9 at 67C) and degrades as it heats
+  (corruption -> MTP rejection), wedging only uncooled at 90C. Cooling raises 72's headroom but the
+  gain is still zero.
 
 What this establishes:
 
 - **The pattern-sweep gate is necessary but NOT sufficient for serving.** NDIV 76 gates 12/12 at
-  2 TB/s (60-71C) yet dies within minutes of real serving - the read data eye fails at serving
-  temperatures. An HBM point needs a real serving-workload rung run to thermal soak, with a
+  2 TB/s (60-71C) yet dies on the first real serving load even started cool - the serving access
+  pattern, not the temperature, is what its eye cannot take. An HBM point needs a real
+  serving-workload rung run to thermal soak, with a
   write/hold/read-back integrity check, before it can be called production-safe (the same
   `gate --workload` discipline the SM side already uses).
 - **Throttle vs corruption is the tell.** Stock DIPS then RECOVERS under heat (self-healing thermal
