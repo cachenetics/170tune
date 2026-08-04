@@ -1,8 +1,8 @@
-# How the CMP 170HX HBM timings work - the constraint structure (BC250-method)
+# How the CMP 170HX HBM timings work - the constraint structure
 
 2026-08-03. The mechanistic understanding of HBM2e memory tuning on this GA100 (8 FBPA / 4096-bit),
-derived the way the BC250 memtune work was: decode the full timing map, compute each field's absolute
-ns at the target clock, and identify which binds - by physics, then verified by isolating each lever
+derived by decoding the full timing map, computing each field's absolute ns at the target clock, and
+identifying which binds - by physics, then verified by isolating each lever
 on the card. All levers are live userspace BAR0 (`fbpa_regs` for timings, `hbm_mclk` for NDIV + the
 DDLL eye recal). Card 1322621047793, driver 610.43.03 patched unlock.
 

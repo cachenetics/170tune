@@ -415,7 +415,7 @@ THE POWER / EFFICIENCY VIEW
   keep stock refresh for hot or unknown-thermal deployments. Loosening refresh also
   slightly shrinks row-disturb margin - minor on a single-tenant compute card.
 
-THE METHOD   (how to work the HBM - the memtune way)
+THE METHOD   (how to work the HBM)
 
   1. Dump the full map ('timings dump'); compute each field's ns at the target clock.
   2. The tightest-ns fields NOT already at a hard floor (CCD) are the binders.
