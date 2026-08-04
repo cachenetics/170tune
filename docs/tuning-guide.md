@@ -474,6 +474,63 @@ decode-bound serving workload that wants every GB/s. Do not repeat the old under
 measurement without re-gating it on the current tooling; the old numbers were taken against a
 different (patched-module) mechanism and are not evidence about the live BAR0 path.
 
+### Memory OC under a REAL serving workload, and the cooling that governs it (2026-08-04)
+
+The HBM matrix (`docs/hbm-matrix.md`) qualifies an NDIV with a hot pattern sweep - a memory-only
+load that runs the HBM at 60-71C. A real inference workload is harsher: sustained compute + memory
+drives the HBM to ~90C, and the OC that passed the pattern gate does NOT survive it. Measured on the
+reference card serving Qwen3.6-27B INT8 (MTP, num_spec=1) under vLLM, single-stream decode (256/256):
+
+```
++----------------------+----------------------------------------------+-------------------------+
+| config               | decode over 3-4 sustained runs               | outcome                 |
++----------------------+----------------------------------------------+-------------------------+
+| stock NDIV 64        | 38.9 -> 36.6 -> 32.6 -> 38.3 tok/s (recovers)| throttles, SELF-HEALS   |
+| NDIV 72 (uncooled)   | 29 -> 21 -> 20 tok/s, HBM 80->87->91C         | corrupts, then WEDGES   |
+| NDIV 72 (fan maxed)  | 37.9 -> 30.5 -> 28.7 -> 25.8, HBM 67->80C     | corrupts (no wedge)     |
+| NDIV 76              | crashes in <3min: Xid 45 launch failure       | UNSERVABLE              |
++----------------------+----------------------------------------------+-------------------------+
+```
+
+What this establishes:
+
+- **The pattern-sweep gate is necessary but NOT sufficient for serving.** NDIV 76 gates 12/12 at
+  2 TB/s (60-71C) yet dies within minutes of real serving - the read data eye fails at serving
+  temperatures. An HBM point needs a real serving-workload rung run to thermal soak, with a
+  write/hold/read-back integrity check, before it can be called production-safe (the same
+  `gate --workload` discipline the SM side already uses).
+- **Throttle vs corruption is the tell.** Stock DIPS then RECOVERS under heat (self-healing thermal
+  throttle). The OC declines MONOTONICALLY and never recovers - that is silent memory corruption
+  feeding MTP rejections (a flipped draft token fails verify -> extra full forward pass -> slower),
+  the exact silent-failure class the whole gate philosophy exists for.
+- **Even fully cooled, the OC buys nothing here.** Fan maxed, NDIV 72 at 67C = 37.9 tok/s = stock's
+  38.9. Single-stream decode of a 27B INT8 model is only ~40% weight-bandwidth-bound (the rest is
+  eager-mode kernels + MTP draft/verify + attention), so +19% HBM read is invisible. The OC adds
+  heat and corruption risk for zero throughput. It may still pay on a genuinely bandwidth-bound
+  workload - but decode, at least this shape, is not one.
+
+**Cooling is the governing lever, not the clock.** The passive 170HX has no onboard fan; on this
+bench a mobo-header fan cools it, and nothing was ramping that fan from GPU temp (it sat at idle
+rpm), so sustained load heat-soaked the HBM to 90C+. Driving it (`gpu-fan-curve`, pwm7/fan7 on this
+board, full by 66C) dropped the NDIV-72 peak 91C -> 80C and stopped the wedges - but a MAXED fan
+still could not hold the HBM below ~75C under 100%-duty benching, and the OC eye starts to fail
+above ~70-75C. Real serving is bursty, not 100% duty, so a cooled card may stay in range in
+practice - but never trust the pattern-sweep gate as a serving qualification.
+
+**Refresh, characterized under serving (stock clock, so no eye confound):** flat on decode and
+temp, safe even very loose (REFRESH 192 = ~30x JEDEC, zero corruption - retention margin is huge
+when the clock is not also stressing the eye), and worth ~2.5% board power loose-vs-tight (206 W vs
+201 W, bracketed to remove thermal drift). That is much less than the ~14% seen at idle, because
+under serving the compute dominates the ~205 W total while at idle refresh is most of the ~40 W.
+Refresh is an idle/resting-power lever - NOT a serving-stability or decode lever. It only looked
+dangerous earlier because it had been stacked on an OC clock.
+
+**Two hard operational rules from this:**
+1. Never change NDIV live under an active serving CUDA context - it wedges the GPU (Xid 45/119,
+   needs a power cycle). Set the clock on an IDLE card, then serve.
+2. Keep the GPU fan driven by HBM temp whenever the card serves; a passive 170HX on a BIOS-curve
+   fan header will heat-soak regardless of clock.
+
 ---
 
 ## 7. Persistence and multi-card safety (persist model corrected 2026-08-03)
