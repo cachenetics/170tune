@@ -109,9 +109,11 @@ more frequent = better retention, more power, less bandwidth; larger = the rever
 ## Production profile
 
 > **SERVING CAVEAT (2026-08-04): these NDIV points are qualified by the hot PATTERN SWEEP, which is
-> memory-only and runs the HBM at 60-71C. Under a real inference workload the HBM reaches ~90C and
-> the read eye fails: NDIV 76 CRASHES vLLM serving (Xid 45) within minutes, NDIV 72 corrupts and
-> degrades. So the profiles below are pattern-sweep-qualified, NOT serving-qualified. Before running
+> memory-only and runs the HBM at 60-71C. They do NOT survive a real inference workload. NDIV 76 is
+> an EYE wall independent of temperature - it threw 4 Xids and wedged on the FIRST vLLM serving load
+> even started cool at 56C (the serving access pattern, not heat, is what its read eye cannot take).
+> NDIV 72 is a THERMAL wall - it serves cool but corrupts/degrades as serving drives HBM to ~90C. So
+> the profiles below are pattern-sweep-qualified, NOT serving-qualified. Before running
 > any OC NDIV under a serving workload, keep the GPU fan driven by HBM temp (`gpu-fan-curve`) and
 > run a real workload rung to thermal soak - and note that even when stable, the memory OC gives ~0
 > decode gain (single-stream decode is not bandwidth-bound). See `docs/tuning-guide.md`, "Memory OC
