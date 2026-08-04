@@ -11,6 +11,15 @@ binds as NDIV rises - is in [`hbm-timing-understanding.md`](hbm-timing-understan
 
 ## The grid (hot, one card)
 
+> **READ THIS FIRST. The GATE column is the PATTERN SWEEP - a memory-only test run cool (60-71C). It
+> is NOT a serving qualification.** Under a real inference workload the picture is very different:
+> **NDIV 70 is the serving-stable ceiling.** NDIV 72 gates 12/12 but silently CORRUPTS as serving
+> heats the HBM past ~75C, and NDIV 74-76 CRASH outright (Xid, wedge) - 76 fails on the first serving
+> load even started cool (it is a read-eye wall, not thermal). So the "GATED 12/12" rows at 72-76 are
+> **peak synthetic bandwidth per clock, not shippable serving points.** For any real workload, ship
+> **NDIV 70** (see Production profile). Full evidence: `docs/tuning-guide.md`, "Memory OC under a REAL
+> serving workload".
+
 NDIV = HBM PLL multiplier, clock = NDIV x 27 MHz. Regenerate this whole table on any card with
 `170tune hbm-matrix` (it drives the sweep and writes a per-serial CSV). The **stock NDIV 64 row is
 fully stock** (stock REFRESH 6); every **OC row is measured at REFRESH 24**, the power-optimized ship
@@ -52,14 +61,22 @@ D2D +20.6%, latency -3.3%**. Read, triad, copy and D2D all climb monotonically, 
 almost 1:1 (read holds ~96% of theoretical peak at every OC NDIV - a genuinely DRAM-bound result,
 not a cache artifact; the stock row reads a bit lower at 95.4% because it runs stock refresh, which
 costs a few percent bandwidth). Read/watt is roughly flat 26-27 across the range and dips only
-slightly to 25.2 at 76 - no efficiency knee, so NDIV 72 is a sensible balance point. Read is
+slightly to 25.2 at 76 - no efficiency knee on the bandwidth curve alone (but that curve is not the
+serving story: for a real workload the ceiling is NDIV 70, see the banner above). Read is
 thermally sensitive - it droops as HBM heats; the MEM C column is the temperature each row was taken
 at, so read is comparable only within the band shown.
 
-## The three ceilings
+## The ceilings
 
-- **NDIV 76 = robust ceiling, any thermal.** Stock cycle counts still clear the DRAM's real floor at
-  2052 MHz; 12/12 hot, bare, reproducible. THE ship point.
+**The serving ceiling and the pattern-sweep ceiling are different numbers.** Under a real inference
+workload the stable ceiling is **NDIV 70** - 72 corrupts as it heats, 74-76 crash. The three ceilings
+below are the PATTERN-SWEEP ceilings (memory-only, cool); they are the bandwidth-benchmark limits,
+not serving limits.
+
+- **NDIV 76 = pattern-sweep ceiling.** Stock cycle counts clear the DRAM's real floor at 2052 MHz;
+  12/12 hot on the memory-only sweep, bare, reproducible. This is the synthetic-bandwidth ceiling and
+  the peak-read ship point for a purely memory-bound bench - it is NOT serving-safe (it wedges on the
+  first real inference load, cool or hot: a read-eye wall the MR2 read-latency field cannot fix).
 - **NDIV 77 = thermal-marginal, not robust.** It hangs on stock timings (a row timing crosses its
   floor) and needs a command-loosening tune just to RUN. Even tuned it is a sharp thermal threshold:
   16/16 clean at mem <=61C, but 11/12 (fails) at 64-66C. The failure is RETENTION (hot cells leak
@@ -120,21 +137,28 @@ more frequent = better retention, more power, less bandwidth; larger = the rever
 > under a REAL serving workload".**
 
 The only change from stock that pays is the CLOCK. Raising NDIV already tightens every timing in ns
-for free (ns = cycles/clock), so stock cycle counts at 76 are both valid (12/12) and maximally
-margined - tighter buys nothing measurable and spends the silent-corruption safety budget; looser
-only adds latency. So production keeps STOCK timings.
+for free (ns = cycles/clock), so stock cycle counts stay valid and maximally margined - tighter buys
+nothing measurable and spends the silent-corruption safety budget; looser only adds latency. So
+production keeps STOCK timings.
 
-- **Robust (default): NDIV 76, stock timings, stock refresh.** +20% triad / +19% peak read / -3%
-  latency (see the grid above), 12/12 hot on any thermal.
-- **Power-optimized: NDIV 76, stock timings, REFRESH field 24.** As above plus ~-14% power (~15%
-  idle), ~16x inside the retention margin. Gate on the target card; keep HBM within normal thermals.
-- **Ultra-conservative: NDIV 75.** Near-identical performance, one extra step of guardband.
+- **SERVING (default): NDIV 70, stock timings, REFRESH field 24, GPU fan driven by HBM temp.** The
+  validated serving ceiling: +10% read over stock, held flawlessly (0 Xids) under sustained
+  single-stream AND concurrent load, HBM <=76C. REFRESH 24 adds the idle-power saving; the fan
+  (`gpu-fan-curve`) is REQUIRED - a passive card heat-soaks and corrupts an OC point above ~75C.
+- **Bench / synthetic-bandwidth only: up to NDIV 76.** The pattern-sweep ceiling - peak memory read
+  (+19%) for a memory-bound benchmark that you have gated under YOUR real workload. Do NOT ship it
+  for serving: 72 corrupts as it heats, 74-76 crash. See the serving caveat above.
+- **Ultra-conservative: NDIV 68.** One extra step of guardband below the serving ceiling.
+
+Note: for a compute/serving workload the memory OC buys ~0 anyway (single-stream decode is only
+~40% weight-bandwidth-bound), so NDIV 70 is chosen for stability + the small margin it gives a
+genuinely bandwidth-bound workload, not for decode speed.
 
 Apply + persist (no daemon; boot-apply re-applies after the driver loads, card still boots stock):
 ```
-170tune mclk-gate 76 12                                 # prove it on THIS card, hot
-170tune persist save --ndiv 76                          # robust default (stock timings/refresh)
-170tune persist save --ndiv 76 --timings "REFRESH 24"   # power-optimized variant (~-14% power)
+170tune mclk-gate 70 12                                 # prove it on THIS card, hot (pattern sweep)
+# then qualify it under YOUR real workload before shipping - the pattern gate is not enough
+170tune persist save --ndiv 70 --timings "REFRESH 24"   # serving default (+ run gpu-fan-curve)
 170tune persist enable
 ```
 
