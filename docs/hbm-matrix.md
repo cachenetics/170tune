@@ -9,18 +9,21 @@ the HBM PLL NDIV, `fbpa_regs` sets the CONFIG timings); the card always boots st
 the ship points; the mechanistic model - the per-field ns constraint structure and which timing
 binds as NDIV rises - is in [`hbm-timing-understanding.md`](hbm-timing-understanding.md).
 
-## The grid (stock timings, hot, one card)
+## The grid (hot, one card)
 
 NDIV = HBM PLL multiplier, clock = NDIV x 27 MHz. Regenerate this whole table on any card with
-`170tune hbm-matrix` (it drives the sweep below and writes a per-serial CSV). Columns:
+`170tune hbm-matrix` (it drives the sweep and writes a per-serial CSV). The **stock NDIV 64 row is
+fully stock** (stock REFRESH 6); every **OC row is measured at REFRESH 24**, the power-optimized ship
+setting, so the grid is the shipped config, not a synthetic one. Columns:
 
 - **PEAK** - theoretical GB/s at that clock (MHz x 4096 bit x 2). **READ** - the delivered peak
   streaming read from `mem_probe`. **%PK** - READ as a fraction of PEAK.
 - **TRIAD / COPY / D2D** - the `nvidia_bench` STREAM kernels; TRIAD (2 read + 1 write) is the closest
   synthetic proxy for decode, D2D is a real `cudaMemcpy` device-to-device.
 - **LAT** - `mem_probe` dependent-load latency (pointer chase over 8 GiB; TLB-sensitive, moves little).
-- **PWR / MEMC** - board power and HBM temperature sampled hot, right after the load. **GB/s/W** -
-  READ per watt. **dSTOCK** - READ vs stock NDIV 64.
+- **PWR** - MEAN board draw sampled during the read load (idle is ~40 W; a pure 2 TB/s read adds
+  ~40 W, so wide HBM2e read power is genuinely ~65-80 W). **MEM C** - HBM temperature that row was
+  taken at. **GB/s/W** - READ per watt. **dSTOCK** - READ vs the fully-stock NDIV 64 row.
 - **MOVED** - READ exceeds the stock 1769 GB/s theoretical wall. That is the clock-moved proof: a read
   above the stock ceiling is impossible unless the DRAM clock actually rose, and it is the one thing
   `nvidia-smi` cannot show (it reports 1728 MHz at every NDIV). A "-" at 66 is not "did not move" -
@@ -29,26 +32,27 @@ NDIV = HBM PLL multiplier, clock = NDIV x 27 MHz. Regenerate this whole table on
 
 | NDIV | MHz | PEAK | READ | %PK | TRIAD | COPY | D2D | LAT ns | PWR W | GB/s/W | MEM C | dSTOCK | MOVED | GATE |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 64 (stock) | 1728 | 1769 | 1701 | 96.1 | 1616 | 1564 | 1602 | 274 | 62 | 27.6 | 59 | baseline | - | (baseline) |
-| 66 | 1782 | 1825 | 1756 | 96.2 | 1671 | 1617 | 1655 | 272 | 66 | 26.6 | 62 | +3.2% | - | pass |
-| 68 | 1836 | 1880 | 1805 | 96.0 | 1722 | 1670 | 1708 | 273 | 74 | 24.5 | 65 | +6.1% | yes | pass |
-| 70 | 1890 | 1935 | 1856 | 95.9 | 1775 | 1721 | 1758 | 271 | 75 | 24.9 | 67 | +9.1% | yes | GATED 12/12 |
-| 72 | 1944 | 1991 | 1908 | 95.9 | 1825 | 1769 | 1808 | 270 | 76 | 25.1 | 68 | +12.2% | yes | GATED 12/12 |
-| 74 | 1998 | 2046 | 1956 | 95.6 | 1872 | 1822 | 1859 | 268 | 81 | 24.2 | 69 | +15.0% | yes | GATED 12/12 |
-| **76** | **2052** | **2101** | **2006** | **95.5** | **1935** | **1873** | **1910** | **267** | **82** | **24.5** | **70** | **+17.9%** | **yes** | **GATED 12/12** |
+| 64 (stock) | 1728 | 1769 | 1687 | 95.4 | 1610 | 1520 | 1584 | 276 | 65 | 26.1 | 60 | baseline | - | (baseline) |
+| 66 | 1782 | 1825 | 1757 | 96.3 | 1669 | 1613 | 1655 | 272 | 67 | 26.4 | 63 | +4.1% | - | pass |
+| 68 | 1836 | 1880 | 1808 | 96.1 | 1724 | 1671 | 1708 | 273 | 67 | 27.0 | 64 | +7.1% | yes | pass |
+| 70 | 1890 | 1935 | 1859 | 96.0 | 1779 | 1722 | 1759 | 271 | 70 | 26.6 | 66 | +10.2% | yes | GATED 12/12 |
+| 72 | 1944 | 1991 | 1909 | 95.9 | 1818 | 1769 | 1808 | 270 | 74 | 25.9 | 68 | +13.2% | yes | GATED 12/12 |
+| 74 | 1998 | 2046 | 1958 | 95.7 | 1885 | 1821 | 1859 | 268 | 76 | 25.7 | 70 | +16.1% | yes | GATED 12/12 |
+| **76** | **2052** | **2101** | **2006** | **95.5** | **1930** | **1873** | **1911** | **267** | **80** | **25.2** | **71** | **+18.9%** | **yes** | **GATED 12/12** |
 | 77 | 2079 | 2129 | - | - | ~1935 | - | - | - | - | - | - | - | - | thermal-marginal |
 | 78 | 2106 | 2156 | - | - | ~1966 | - | - | - | - | - | - | - | - | REJECTED (eye wall) |
 
-The 64-76 rows are a single hot `170tune hbm-matrix 64 2 76` sweep (mem 59-70C, shown per row). 77
+The 64-76 rows are a single hot `170tune hbm-matrix 64 2 76` sweep (mem 60-71C, shown per row). 77
 and 78 are NOT bandwidth-swept: bare NDIV 77 hard-hangs the controller (a row timing crosses its
 floor - see the ceilings below), so the matrix stops at the robust ceiling; their triad figures are
 from the separate command-tuned ceiling hunt.
 
-vs stock, NDIV 76: **read +17.9%, triad +19.8%, copy +19.7%, D2D +19.2%, latency -2.5%**. Read, triad,
-copy and D2D all climb monotonically to 76, tracking the clock almost 1:1 (read holds ~96% of
-theoretical peak at every NDIV - a genuinely DRAM-bound result, not a cache artifact). Read/watt
-declines monotonically (best at stock ~27.6 GB/s-per-W, ~24.5 at 76) - no efficiency knee, so NDIV 72
-is a sensible balance point (~85% of the triad gain at ~91% of stock read/watt). Read is
+vs the fully-stock baseline, NDIV 76 (at REFRESH 24): **read +18.9%, triad +19.9%, copy +23.2%,
+D2D +20.6%, latency -3.3%**. Read, triad, copy and D2D all climb monotonically, tracking the clock
+almost 1:1 (read holds ~96% of theoretical peak at every OC NDIV - a genuinely DRAM-bound result,
+not a cache artifact; the stock row reads a bit lower at 95.4% because it runs stock refresh, which
+costs a few percent bandwidth). Read/watt is roughly flat 26-27 across the range and dips only
+slightly to 25.2 at 76 - no efficiency knee, so NDIV 72 is a sensible balance point. Read is
 thermally sensitive - it droops as HBM heats; the MEM C column is the temperature each row was taken
 at, so read is comparable only within the band shown.
 
@@ -109,7 +113,7 @@ for free (ns = cycles/clock), so stock cycle counts at 76 are both valid (12/12)
 margined - tighter buys nothing measurable and spends the silent-corruption safety budget; looser
 only adds latency. So production keeps STOCK timings.
 
-- **Robust (default): NDIV 76, stock timings, stock refresh.** +20% triad / +18% peak read / -3%
+- **Robust (default): NDIV 76, stock timings, stock refresh.** +20% triad / +19% peak read / -3%
   latency (see the grid above), 12/12 hot on any thermal.
 - **Power-optimized: NDIV 76, stock timings, REFRESH field 24.** As above plus ~-14% power (~15%
   idle), ~16x inside the retention margin. Gate on the target card; keep HBM within normal thermals.
