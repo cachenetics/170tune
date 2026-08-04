@@ -1472,6 +1472,16 @@ cmd_install() {
     local prefix=${1:-/usr/local/bin}
     mkdir -p "$prefix" 2>/dev/null || die "cannot create $prefix"
     local D; D=$(dirname "$SELF")
+    # install builds every helper FROM SOURCE, so it must run from the source checkout (the tools/
+    # dir alongside this script), never the installed copy. Invoked as the PATH binary
+    # ('170tune install' -> /usr/local/bin/170tune), $D is the install prefix, which holds no
+    # *.c/*.cu - fail LOUDLY with the fix instead of half-installing (and, worse, unlinking the
+    # co-located scripts below). The normal path './install.sh' resolves $D to the checkout's tools/.
+    if [ ! -f "$D/hbm_mclk.c" ]; then
+        die "install must run from the 170tune source checkout, not the installed copy.
+  cd into the repo you git-pulled and run:  ./install.sh   (or ./tools/170tune install)
+  (invoked as '$SELF'; its dir '$D' has no tool sources.)"
+    fi
     local tmp; tmp=$(mktemp -d) || die "cannot create a temp build dir"
     local ok=0 fail=0
 
@@ -1529,9 +1539,12 @@ cmd_install() {
     fi
     local extra
     for extra in 170hx-oc 170hx-sweep 170hx-soak vllm_workload_check.sh; do
-        if [ -f "$D/$extra" ]; then
+        if [ -f "$D/$extra" ] && cp "$D/$extra" "$tmp/$extra" 2>/dev/null; then
+            # Route through $tmp before unlinking, exactly as the 170tune script above: if $prefix
+            # equals $D the source and target are the same path, so unlinking first would delete
+            # the source. Copying to $tmp makes the unlink safe.
             rm -f "$prefix/$extra" 2>/dev/null
-            install -m 755 "$D/$extra" "$prefix/$extra" 2>/dev/null && { say "${c_ok}[ok] $extra${c_off}"; ok=$((ok+1)); } \
+            install -m 755 "$tmp/$extra" "$prefix/$extra" 2>/dev/null && { say "${c_ok}[ok] $extra${c_off}"; ok=$((ok+1)); } \
                 || { say "${c_bad}[FAIL] $extra: could not install to $prefix${c_off}"; fail=$((fail+1)); }
         else
             say "${c_bad}[FAIL] $extra: source not found at $D/$extra${c_off}"; fail=$((fail+1))
