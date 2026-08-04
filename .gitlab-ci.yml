@@ -1,0 +1,67 @@
+# GitLab CI for root/170tune (proj 63) - the canonical, hardware-verified 170HX tuning tool.
+#
+# Runs on the shared instance runner (cachenetics-runner-shared), a SHELL executor as the
+# gitlab-runner user on the cache host. The shell executor ignores `image:`; the toolchain
+# (bash, shellcheck, gcc, and the CUDA toolkit at /opt/cuda) comes from the host.
+#
+# This gate cannot touch hardware - it never applies a tuning point, never writes a card, never
+# installs to the system. It is a STATIC + BUILD smoke test: every shipped script parses and is
+# shellcheck-clean, and every C/CUDA helper compiles from source with the exact flags the
+# installer uses. It exists so a future edit that breaks the build or introduces a shell fault is
+# caught here instead of on a card mid-tune. The full correctness proof is still the hardware gate
+# (install/preflight/snapshot-stock/mclk-gate/persist self-disarm across a reboot) - CI does not
+# replace it, it guards the source it runs from.
+
+stages:
+  - gate
+
+# --- static: shell parse + shellcheck (warning level, zero findings expected) ---------------
+lint:
+  stage: gate
+  needs: []
+  script:
+    - set -eu
+    - SCRIPTS="install.sh tools/170tune tools/170hx-oc tools/170hx-soak tools/170hx-sweep tools/setup-vllm-170hx.sh tools/vllm_workload_check.sh"
+    - echo "== bash -n =="
+    - for f in $SCRIPTS; do bash -n "$f" && echo "ok $f"; done
+    - echo "== shellcheck -S warning =="
+    - command -v shellcheck >/dev/null || { echo "shellcheck not installed on the runner"; exit 1; }
+    - shellcheck -S warning $SCRIPTS
+    - echo "all scripts parse and are shellcheck-clean at warning level"
+
+# --- build: compile every helper from source, exact installer flags, into a throwaway dir ------
+build:
+  stage: gate
+  needs: []
+  script:
+    - set -eu
+    - out="$(mktemp -d)"; trap 'rm -rf "$out"' EXIT
+    # Locate the CUDA toolkit the same way tools/170tune install does: PATH, then common roots.
+    - |
+      nvcc_bin=""; cuda_root=""
+      if command -v nvcc >/dev/null 2>&1; then nvcc_bin="$(command -v nvcc)"; cuda_root="$(dirname "$(dirname "$nvcc_bin")")";
+      else for c in /opt/cuda /usr/local/cuda /usr/lib/cuda; do [ -x "$c/bin/nvcc" ] && { cuda_root="$c"; nvcc_bin="$c/bin/nvcc"; break; }; done; fi
+      echo "nvcc: ${nvcc_bin:-<none>}  cuda_root: ${cuda_root:-<none>}"
+    - echo "== gcc tools =="
+    - gcc -O2 -o "$out/hbm_mclk"  tools/hbm_mclk.c  && echo "ok hbm_mclk"
+    - gcc -O2 -o "$out/fbpa_regs" tools/fbpa_regs.c && echo "ok fbpa_regs"
+    - |
+      if [ -n "$cuda_root" ]; then inc="-I$cuda_root/include"; else inc=""; fi
+      gcc -O2 -o "$out/nvml_oc" tools/nvml_oc.c $inc -lnvidia-ml && echo "ok nvml_oc"
+    - |
+      # CUDA helpers are required when nvcc is present (the cache runner has it); if a future
+      # runner has no CUDA toolkit this degrades to a loud skip rather than a red pipeline, exactly
+      # as the installer treats nvcc as best-effort.
+      if [ -z "$nvcc_bin" ]; then echo "WARN nvcc not found - skipping CUDA helper build (gate/mclk-gate/recover unbuilt)"; exit 0; fi
+      echo "== cuda tools =="
+      "$nvcc_bin" -O2 -o "$out/gpu_selftest"  tools/gpu_selftest.cu  -arch=sm_80          && echo "ok gpu_selftest"
+      "$nvcc_bin" -O2 -o "$out/compute_check" tools/compute_check.cu -arch=sm_80 -lcublas && echo "ok compute_check"
+      "$nvcc_bin" -O2 -o "$out/oc_eff"        tools/oc_eff.cu        -arch=sm_80 -lcublas -lnvidia-ml && echo "ok oc_eff"
+      "$nvcc_bin" -O2 -o "$out/mem_probe"     tools/mem_probe.cu     -arch=sm_80          && echo "ok mem_probe"
+      "$nvcc_bin" -O2 -o "$out/gemm_probe"    tools/gemm_probe.cu    -arch=sm_80 -lcublas && echo "ok gemm_probe"
+      "$nvcc_bin" -O2 -o "$out/ctx_probe"     tools/ctx_probe.cu     -arch=sm_80          && echo "ok ctx_probe"
+      "$nvcc_bin" -O2 -o "$out/nvidia_bench"  tools/nvidia_bench.cu -lnvidia-ml -ldl \
+        -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
+        -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+        -gencode arch=compute_90,code=sm_90 && echo "ok nvidia_bench"
+    - echo "all helpers compiled"
