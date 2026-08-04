@@ -501,6 +501,19 @@ reference card serving Qwen3.6-27B INT8 (MTP, num_spec=1) under vLLM, single-str
   (corruption -> MTP rejection), wedging only uncooled at 90C. Cooling raises 72's headroom but the
   gain is still zero.
 
+**The MR2 read-latency lever - tested and ruled out (2026-08-04).** The 76 eye wall is a DRAM
+read-latency mismatch: our userspace NDIV raises the clock to 2052 MHz but leaves the DRAM mode
+registers at their stock 1728 MHz values (confirmed - MR2 `0x009A0338`, MR1, tCL/tWL all read
+identical across NDIV 64/70/76), so the read strobe fires ~19% too early in real time and misses
+the eye. The DRAM-side lever is MR2 Read Latency (`0x009A0338`, RL in OP[7:3]; this card ships
+RL=29). We raised it: RL 29 -> 31 (the field max, `0x003000FB`) + tCL 37 -> 39 + a DDLL recal - the
+write stuck and still passed the pattern gate, but 76 serving crashed identically (6 Xids, wedge).
+Holding stock latency-ns at 2052 MHz needs RL ~= 34 cycles, and the 5-bit RL field caps at 31. So
+**76 is a hardware FIELD-WIDTH wall: the read-latency register runs out of range before it can
+re-center the eye at 2052 MHz.** The one unexplored thread is whether byte 2 of the MR2 shadow
+(`0x30`) holds extended RL bits above the 5-bit field; unconfirmed, and each test costs a wedge, so
+it is parked. Net: 76 is not serving-recoverable by any known lever; 70 is the ceiling.
+
 What this establishes:
 
 - **The pattern-sweep gate is necessary but NOT sufficient for serving.** NDIV 76 gates 12/12 at
