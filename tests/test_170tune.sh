@@ -40,6 +40,8 @@ control_set() {
 
 reset_controls() {
     : > "$TMP/calls.log"
+    : > "$TMP/control/xid_sequence"
+    : > "$TMP/control/ctx_rc_sequence"
     control_set serial TESTSERIAL
     control_set devid 0x2082
     control_set driver 610.43.03
@@ -85,6 +87,23 @@ cat > "$TMP/bin/sync" <<'STUB'
 exit 0
 STUB
 
+cat > "$TMP/bin/date" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -Is) printf '2026-08-05T12:00:00+08:00\n' ;;
+    *) /bin/date "$@" ;;
+esac
+STUB
+
+cat > "$TMP/bin/cat" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = /proc/sys/kernel/random/boot_id ]; then
+    printf 'test-boot-id\n'
+else
+    /bin/cat "$@"
+fi
+STUB
+
 cat > "$TMP/bin/nvidia-smi" <<'STUB'
 #!/usr/bin/env bash
 set -u
@@ -108,7 +127,14 @@ STUB
 
 cat > "$TMP/bin/dmesg" <<'STUB'
 #!/usr/bin/env bash
-n=$(cat "${TEST_ROOT:?}/control/xid_count")
+c=${TEST_ROOT:?}/control
+if [ -s "$c/xid_sequence" ]; then
+    n=$(head -1 "$c/xid_sequence")
+    sed '1d' "$c/xid_sequence" > "$c/xid_sequence.tmp"
+    mv "$c/xid_sequence.tmp" "$c/xid_sequence"
+else
+    n=$(cat "$c/xid_count")
+fi
 i=0
 while [ "$i" -lt "$n" ]; do
     printf 'NVRM: Xid 13\n'
@@ -194,7 +220,15 @@ STUB
 cat > "$TMP/bin/ctx_probe" <<'STUB'
 #!/usr/bin/env bash
 printf 'ctx_probe %s\n' "$*" >> "${TEST_ROOT:?}/calls.log"
-exit "$(cat "${TEST_ROOT}/control/ctx_rc")"
+c=${TEST_ROOT}/control
+if [ -s "$c/ctx_rc_sequence" ]; then
+    rc=$(head -1 "$c/ctx_rc_sequence")
+    sed '1d' "$c/ctx_rc_sequence" > "$c/ctx_rc_sequence.tmp"
+    mv "$c/ctx_rc_sequence.tmp" "$c/ctx_rc_sequence"
+else
+    rc=$(cat "$c/ctx_rc")
+fi
+exit "$rc"
 STUB
 
 cat > "$TMP/bin/oc_eff" <<'STUB'
@@ -383,6 +417,86 @@ test_hbm_force_override_is_explicit() {
     printf 'PASS: HBM force override is explicit\n'
 }
 
+test_combined_hbm_gate_writes_exact_receipt() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    output=$(run_tune hbm-gate --ndiv 70 --timings "REFRESH 24" \
+        --sweeps 4 --workload true 2>&1) ||
+        fail "combined HBM gate rejected a clean profile: $output"
+    assert_contains "$output" "HBM PROFILE QUALIFIED"
+    assert_eq "$(cat "$TMP/control/ndiv")" 70
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 24
+    receipt=$(find "$TMP/state/gated-hbm/TESTSERIAL" -name '*.json' -type f | head -1)
+    [ -f "$receipt" ] || fail "combined HBM gate wrote no receipt"
+    assert_file_contains "$receipt" '"ndiv": 70'
+    assert_file_contains "$receipt" '"timings": "REFRESH 24"'
+    assert_file_contains "$receipt" '"sweeps": 4'
+    assert_file_contains "$receipt" '"workload": "true"'
+    assert_file_contains "$receipt" '"workload_rc": 0'
+    sweeps=$(grep -c '^gpu_selftest ' "$TMP/calls.log")
+    assert_eq "$sweeps" 4
+    printf 'PASS: combined HBM gate writes exact receipt\n'
+}
+
+run_rejected_hbm_gate() {
+    rm -rf "$TMP/state/gated-hbm"
+    set +e
+    run_tune hbm-gate --ndiv 70 --timings "REFRESH 24" \
+        --sweeps 4 --workload "${1:-true}" >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "$2 was accepted"
+    [ ! -d "$TMP/state/gated-hbm/TESTSERIAL" ] ||
+        [ -z "$(find "$TMP/state/gated-hbm/TESTSERIAL" -name '*.json' -type f -print -quit)" ] ||
+        fail "$2 wrote a receipt"
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+}
+
+test_combined_hbm_gate_rejects_and_reverts_failures() {
+    reset_controls
+    if run_tune hbm-gate --ndiv 70 --timings "CL 24" --sweeps 4 \
+        --workload true >/dev/null 2>&1; then
+        fail "timing without a known stock value was accepted"
+    fi
+    if grep -q '^fbpa_regs set CL ' "$TMP/calls.log"; then
+        fail "unsupported timing was written before its rollback safety was checked"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+
+    reset_controls
+    control_set selftest_errors 1
+    run_rejected_hbm_gate true "memory corruption"
+
+    reset_controls
+    control_set selftest_compute_ok 0
+    run_rejected_hbm_gate true "selftest compute mismatch"
+
+    reset_controls
+    printf '0\n2\n' > "$TMP/control/ctx_rc_sequence"
+    run_rejected_hbm_gate true "post-gate CUDA context failure"
+
+    reset_controls
+    run_rejected_hbm_gate false "workload failure"
+
+    reset_controls
+    control_set hbm_temp 59
+    run_rejected_hbm_gate true "cold gate"
+
+    reset_controls
+    control_set timing_ignore_set 1
+    run_rejected_hbm_gate true "timing readback mismatch"
+
+    reset_controls
+    control_set hbm_ignore_set 1
+    run_rejected_hbm_gate true "NDIV readback mismatch"
+
+    reset_controls
+    printf '0\n1\n' > "$TMP/control/xid_sequence"
+    run_rejected_hbm_gate true "new Xid"
+    printf 'PASS: combined HBM gate rejects and reverts failures\n'
+}
+
 test_path_overrides_isolate_state
 test_hbm_profile_identity_is_canonical
 test_hbm_profile_rejects_malformed_timings
@@ -390,3 +504,5 @@ test_missing_hbm_receipt_is_rejected
 test_exact_hbm_receipt_is_written_and_accepted
 test_hbm_receipt_contents_are_authoritative
 test_hbm_force_override_is_explicit
+test_combined_hbm_gate_writes_exact_receipt
+test_combined_hbm_gate_rejects_and_reverts_failures

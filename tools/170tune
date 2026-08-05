@@ -1136,6 +1136,10 @@ _hot_gate_sweeps() {
     local n=${1:-4} label=${2:-oc} soakmax=${3:-$GATE_SOAK_MAX} recal=${4:-}
     [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST (set SELFTEST=...)"
     local fails=0 i res errs tmax=0 t
+    LAST_GATE_SWEEPS=$n
+    LAST_GATE_PEAK_HBM=0
+    LAST_GATE_COMPUTE_OK=0
+    LAST_GATE_CONTEXT_OK=0
     # Soak to operating temp ONCE, then recal the eye ONCE in that state. Do NOT re-soak (oc_eff)
     # between sweeps: a heavy core soak between sweeps swings the core clock and drifts the eye - a
     # GATE ARTIFACT that faults even a rock-solid NDIV. Steady back-to-back memory sweeps hold temp
@@ -1170,7 +1174,13 @@ _hot_gate_sweeps() {
         arm "$label" 0
         local crc; timeout $((GATE_COMPUTE + 120)) "$COMPUTE" "$GATE_COMPUTE" >/dev/null 2>&1; crc=$?
         disarm
-        [ $crc -eq 0 ] && say "  compute: ${c_ok}clean${c_off}" || { say "  compute: ${c_bad}FAILED${c_off}"; fails=$((fails + 1)); }
+        if [ $crc -eq 0 ]; then
+            LAST_GATE_COMPUTE_OK=1
+            say "  compute: ${c_ok}clean${c_off}"
+        else
+            say "  compute: ${c_bad}FAILED${c_off}"
+            fails=$((fails + 1))
+        fi
     else
         say "  ${c_warn}compute check skipped (compute_check not found) - memory-only gate${c_off}"
     fi
@@ -1181,13 +1191,146 @@ _hot_gate_sweeps() {
         say "  ${c_bad}context check: FAILED - the card answers nvidia-smi but no CUDA context can be created${c_off}"
         say "  ${c_bad}  this is the wedge query-based checks miss. Do not trust the sweep results above - recover first.${c_off}"
         fails=$((fails + 1))
+    else
+        LAST_GATE_CONTEXT_OK=1
     fi
+    LAST_GATE_PEAK_HBM=${tmax:-0}
     if [ "${tmax:-0}" -lt "$GATE_TEMP" ] 2>/dev/null; then
         say "${c_bad}REJECTED: HBM never reached ${GATE_TEMP}C (peaked ${tmax}C) - a cold gate cannot bless $label${c_off}"
         return 1
     fi
     [ "$fails" -eq 0 ] && { say "${c_ok}GATED: $label passed $n/$n sweeps + compute (peak HBM ${tmax}C)${c_off}"; return 0; }
     say "${c_bad}REJECTED: $fails/$n failed ($label)${c_off}"; return 1
+}
+
+apply_hbm_timings() {
+    local normalized field value readback
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # Intentional splitting of canonical FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        "$FBPA_REGS" set "$field" "$value" >/dev/null 2>&1 || return 1
+        readback=$("$FBPA_REGS" get "$field" 2>/dev/null) || return 1
+        [ "$readback" = "$value" ] || return 1
+    done
+}
+
+verify_hbm_profile() {
+    local ndiv=$1 normalized field value readback
+    normalized=$(normalize_timings "${2:-}") || return 1
+    [ "$(cur_ndiv)" = "$ndiv" ] || return 1
+    [ -n "$normalized" ] || return 0
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        readback=$("$FBPA_REGS" get "$field" 2>/dev/null) || return 1
+        [ "$readback" = "$value" ] || return 1
+    done
+}
+
+stock_timing_value() {
+    local wanted=$1 kv
+    if [ "$wanted" = REFRESH ]; then
+        printf '%s\n' "$STOCK_REFRESH"
+        return 0
+    fi
+    for kv in $STOCK_TIMINGS; do
+        if [ "${kv%:*}" = "$wanted" ]; then
+            printf '%s\n' "${kv#*:}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_rollbackable_timings() {
+    local normalized field value
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # Intentional splitting of canonical FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        if ! stock_timing_value "$field" >/dev/null; then
+            say "${c_bad}refusing timing $field: no stock rollback value is configured${c_off}"
+            return 1
+        fi
+    done
+}
+
+restore_hbm_timings() {
+    local normalized field value stock
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        stock=$(stock_timing_value "$field") || continue
+        "$FBPA_REGS" set "$field" "$stock" >/dev/null 2>&1 || true
+    done
+}
+
+reject_hbm_profile() {
+    local timings=${1:-} reason=${2:-failed}
+    say "${c_bad}HBM PROFILE REJECTED: $reason; reverting HBM to stock${c_off}"
+    mclk_revert
+    restore_hbm_timings "$timings"
+    disarm
+    return 1
+}
+
+cmd_hbm_gate() {
+    local ndiv="" timings="" sweeps=4 workload="" normalized rc xids_before xids_after
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ndiv) ndiv=${2:?--ndiv needs a value}; shift 2 ;;
+            --timings) timings=${2:?--timings needs FIELD VALUE pairs}; shift 2 ;;
+            --sweeps) sweeps=${2:?--sweeps needs a count}; shift 2 ;;
+            --workload) workload=${2:?--workload needs a command}; shift 2 ;;
+            *) die "unknown hbm-gate argument '$1'" ;;
+        esac
+    done
+    [ -n "$ndiv" ] || die "usage: hbm-gate --ndiv N [--timings \"FIELD VALUE ...\"] [--sweeps N] [--workload COMMAND]"
+    [[ "$ndiv" =~ ^[0-9]+$ ]] || die "invalid NDIV '$ndiv'"
+    [[ "$sweeps" =~ ^[0-9]+$ ]] && [ "$sweeps" -gt 0 ] || die "invalid sweep count '$sweeps'"
+    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
+    [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
+    [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST"
+    [ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ] || die "hbm-gate requires the compute checker"
+    refuse_if_mclk_baked "hbm-gate"
+    wedged && die "GPU is wedged - run 'recover' first"
+    ctx_dead && die "GPU answers but takes no CUDA context - run 'recover' first"
+    normalized=$(normalize_timings "$timings") || return 1
+    validate_rollbackable_timings "$normalized" || return 1
+    xids_before=$(xids || true); xids_before=${xids_before:-0}
+    apply_hbm_timings "$normalized" || { reject_hbm_profile "$normalized" "timing apply/readback failed"; return 1; }
+    "$HBM_MCLK" set "$ndiv" >/dev/null 2>&1 || { reject_hbm_profile "$normalized" "NDIV $ndiv did not lock"; return 1; }
+    verify_hbm_profile "$ndiv" "$normalized" || { reject_hbm_profile "$normalized" "initial readback failed"; return 1; }
+    _hot_gate_sweeps "$sweeps" "hbm-profile-$(hbm_profile_id "$ndiv" "$normalized")" "$MCLK_GATE_SOAK_MAX" || {
+        reject_hbm_profile "$normalized" "hot correctness gate failed"
+        return 1
+    }
+    if [ -n "$workload" ]; then
+        say "  workload: $workload"
+        arm "hbm-workload" "$ndiv"
+        timeout "$WORKLOAD_TIMEOUT" bash -c "$workload"; rc=$?
+        disarm
+        [ "$rc" -eq 0 ] || { reject_hbm_profile "$normalized" "workload failed (exit $rc)"; return 1; }
+    else
+        rc=0
+    fi
+    verify_hbm_profile "$ndiv" "$normalized" || { reject_hbm_profile "$normalized" "final readback failed"; return 1; }
+    xids_after=$(xids || true); xids_after=${xids_after:-0}
+    [ "$xids_after" -le "$xids_before" ] || { reject_hbm_profile "$normalized" "new Xid detected"; return 1; }
+    write_hbm_receipt "$ndiv" "$normalized" "$LAST_GATE_SWEEPS" "$LAST_GATE_PEAK_HBM" "$workload" "$rc" >/dev/null
+    say "${c_ok}HBM PROFILE QUALIFIED: NDIV $ndiv timings '$normalized' on card $(serial)${c_off}"
 }
 
 cmd_mclk_try() {
@@ -2023,6 +2166,8 @@ HBM MEMORY LEVERS (live userspace BAR0 - no driver rebuild; the unlock opens the
   mclk-try   <NDIV>           set the HBM clock live (NDIV*27 MHz), prove it moved. UNVERIFIED.
   mclk-gate  <NDIV> [n]       the proof: core pinned stock, n hot full-VRAM sweeps + compute.
                               A cold gate is a FAILURE - HBM silent corruption is temp-dependent.
+  hbm-gate --ndiv N [--timings "FIELD VALUE ..."] [--sweeps N] [--workload "COMMAND"]
+                              qualify the exact combined HBM profile and write its per-card receipt.
   mclk-ladder [start] [step] [max]
                               walk NDIV up (default 65 1 80), gate each rung hot, stop at the
                               first that runs but fails the gate. Leaves the card on the highest
@@ -2143,6 +2288,7 @@ case "${1:-}" in
     mclk-status) shift; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"; need_root mclk-status; "$HBM_MCLK" get ;;
     mclk-try)    shift; need_root mclk-try "$@"; cmd_mclk_try "$@" ;;
     mclk-gate)   shift; need_root mclk-gate "$@"; cmd_mclk_gate "$@" ;;
+    hbm-gate)    shift; need_root hbm-gate "$@"; cmd_hbm_gate "$@" ;;
     mclk-ladder) shift; need_root mclk-ladder "$@"; cmd_mclk_ladder "$@" ;;
     hbm-matrix)  shift; need_root hbm-matrix "$@"; cmd_hbm_matrix "$@" ;;
     refresh)      shift; need_root refresh "$@"; cmd_refresh "$@" ;;
