@@ -172,9 +172,20 @@ iso_timestamp() {
     date -Is 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+fraction_to_milli() {
+    local value=${1:-}
+    [[ "$value" =~ ^(0|0?[.][0-9]+|1([.]0+)?)$ ]] || return 1
+    awk -v value="$value" 'BEGIN {
+        if (value <= 0 || value > 1) exit 1
+        printf "%d\n", value * 1000
+    }'
+}
+
 write_hbm_receipt() {
     local ndiv=${1:?ndiv} timings=${2:-} sweeps=${3:?sweeps} peak=${4:?peak_hbm_c}
-    local workload=${5:-} workload_rc=${6:-0} normalized receipt workload_json
+    local workload=${5:-} workload_rc=${6:-0}
+    local sweep_mode=${7:-resident-two-phase-v1} sweep_fraction_milli=${8:-950}
+    local normalized receipt workload_json
     normalized=$(normalize_timings "$timings") || return 1
     receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
     mkdir -p "$(dirname "$receipt")"
@@ -187,6 +198,7 @@ write_hbm_receipt() {
 {"serial": "$(json_escape "$(serial)")", "device_id": "$(json_escape "$(devid)")",
  "driver_version": "$(json_escape "$(driver_version)")", "vbios_version": "$(json_escape "$(vbios_version)")",
  "ndiv": $ndiv, "timings": "$(json_escape "$normalized")", "sweeps": $sweeps, "peak_hbm_c": $peak,
+ "sweep_mode": "$(json_escape "$sweep_mode")", "sweep_fraction_milli": $sweep_fraction_milli,
  "compute_check": true, "context_check": true, "workload": $workload_json,
  "workload_timeout": ${WORKLOAD_TIMEOUT:-0}, "workload_rc": $workload_rc, "gated": "$(iso_timestamp)"}
 EOF
@@ -218,6 +230,7 @@ hbm_receipt_structure_ok() {
     compact=$(LC_ALL=C tr -d '[:space:]' < "$file")
     case "$compact" in \{*\}) ;; *) return 1 ;; esac
     for key in serial device_id driver_version vbios_version ndiv timings sweeps peak_hbm_c \
+               sweep_mode sweep_fraction_milli \
                compute_check context_check workload workload_timeout workload_rc gated; do
         count=$(grep -oE "\"${key}\"[[:space:]]*:" "$file" 2>/dev/null | wc -l | tr -d ' ')
         [ "$count" = 1 ] || return 1
@@ -227,12 +240,14 @@ hbm_receipt_structure_ok() {
 HBM_RECEIPT_FORCED=0
 hbm_receipt_gate() {
     local ndiv=${1:?ndiv} timings=${2:-} force=${3:-0} receipt normalized reason=""
-    local rec_peak rec_sweeps rec_timeout rec_workload_rc rec_gated
+    local rec_peak rec_sweeps rec_mode rec_fraction rec_timeout rec_workload_rc rec_gated
     HBM_RECEIPT_FORCED=0
     normalized=$(normalize_timings "$timings") || return 1
     receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
     rec_peak=$(receipt_number_field "$receipt" peak_hbm_c)
     rec_sweeps=$(receipt_number_field "$receipt" sweeps)
+    rec_mode=$(receipt_string_field "$receipt" sweep_mode)
+    rec_fraction=$(receipt_number_field "$receipt" sweep_fraction_milli)
     rec_timeout=$(receipt_number_field "$receipt" workload_timeout)
     rec_workload_rc=$(receipt_number_field "$receipt" workload_rc)
     rec_gated=$(receipt_string_field "$receipt" gated)
@@ -260,6 +275,14 @@ hbm_receipt_gate() {
         reason="HBM gate receipt has no valid sweep count"
     elif [ "$rec_sweeps" -lt 4 ]; then
         reason="HBM gate receipt has fewer than four hot sweeps"
+    elif [ "$rec_mode" != resident-two-phase-v1 ]; then
+        reason="HBM gate receipt was not produced by the resident two-phase sweep"
+    elif ! [[ "$rec_fraction" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid sweep coverage"
+    elif [ "$rec_fraction" -lt 950 ]; then
+        reason="HBM gate receipt covered less than 95 percent of free VRAM"
+    elif [ "$rec_fraction" -gt 1000 ]; then
+        reason="HBM gate receipt claims more than 100 percent sweep coverage"
     elif [ "$(receipt_bool_field "$receipt" compute_check)" != true ]; then
         reason="HBM gate receipt has no passing compute check"
     elif [ "$(receipt_bool_field "$receipt" context_check)" != true ]; then
@@ -1165,11 +1188,15 @@ mclk_verify() {
 _hot_gate_sweeps() {
     local n=${1:-4} label=${2:-oc} soakmax=${3:-$GATE_SOAK_MAX} recal=${4:-}
     [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST (set SELFTEST=...)"
-    local fails=0 i res errs tmax=0 t
+    local fails=0 i res errs tmax=0 t sweep_fraction sweep_fraction_milli
+    sweep_fraction=${SWEEP_FRAC:-0.95}
+    sweep_fraction_milli=$(fraction_to_milli "$sweep_fraction") || die "invalid SWEEP_FRAC '$sweep_fraction'"
     LAST_GATE_SWEEPS=$n
     LAST_GATE_PEAK_HBM=0
     LAST_GATE_COMPUTE_OK=0
     LAST_GATE_CONTEXT_OK=0
+    LAST_GATE_SWEEP_MODE=resident-two-phase-v1
+    LAST_GATE_SWEEP_FRAC_MILLI=$sweep_fraction_milli
     # Soak to operating temp ONCE, then recal the eye ONCE in that state. Do NOT re-soak (oc_eff)
     # between sweeps: a heavy core soak between sweeps swings the core clock and drifts the eye - a
     # GATE ARTIFACT that faults even a rock-solid NDIV. Steady back-to-back memory sweeps hold temp
@@ -1178,10 +1205,11 @@ _hot_gate_sweeps() {
     t=$(GATE_SOAK_MAX=$soakmax soak_to_temp); tmax=${t:-0}
     [ -n "$recal" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
     disarm
-    local out cok swept
+    local out cok swept complete mode result sweep_rc
     for i in $(seq 1 "$n"); do
         arm "$label" 0
-        out=$(timeout "$SWEEP_TIMEOUT" "$SELFTEST" "${SWEEP_FRAC:-0.15}" 2>&1)
+        out=$(timeout "$SWEEP_TIMEOUT" "$SELFTEST" "$sweep_fraction" 2>&1)
+        sweep_rc=$?
         disarm
         t=$(gpu_temp); [ "${t:-0}" -gt "$tmax" ] 2>/dev/null && tmax=$t
         # rare: if the card cooled below the gate floor, re-soak AND re-recal (a soak swings the core)
@@ -1191,9 +1219,20 @@ _hot_gate_sweeps() {
         errs=$(printf '%s' "$out" | grep -oE 'MEM_ERRORS=[0-9]+' | head -1 | cut -d= -f2)
         cok=$(printf '%s' "$out" | grep -oE 'COMPUTE_OK=[0-9]+' | head -1 | cut -d= -f2)
         swept=$(printf '%s' "$out" | grep -oE 'MEM_SWEPT_MIB=[0-9]+' | head -1 | cut -d= -f2)
+        complete=$(printf '%s' "$out" | grep -oE 'MEM_COMPLETE=[0-9]+' | head -1 | cut -d= -f2)
+        mode=$(printf '%s' "$out" | grep -oE 'MEM_SWEEP_MODE=[A-Za-z0-9._-]+' | head -1 | cut -d= -f2)
+        result=$(printf '%s' "$out" | grep -oE 'RESULT=(PASS|FAIL)' | head -1 | cut -d= -f2)
         # A missing MEM_ERRORS means the sweep did not run (tool path, permissions) - FAIL, never pass.
-        if [ -z "$errs" ]; then say "  sweep $i: ${c_bad}did not run (no MEM_ERRORS from $SELFTEST)${c_off}"; fails=$((fails + 1)); continue; fi
-        if [ "$errs" -ne 0 ] || [ "${cok:-0}" -ne 1 ]; then
+        if [ "$sweep_rc" -ne 0 ] || [ "$result" != PASS ]; then
+            say "  sweep $i: ${c_bad}selftest failed rc=$sweep_rc result=${result:-missing}${c_off}  (${swept:-?}MiB, HBM ${t}C)"
+            fails=$((fails + 1))
+        elif [ -z "$errs" ]; then
+            say "  sweep $i: ${c_bad}did not run (no MEM_ERRORS from $SELFTEST)${c_off}"
+            fails=$((fails + 1))
+        elif [ "$mode" != resident-two-phase-v1 ] || [ "${complete:-0}" -ne 1 ]; then
+            say "  sweep $i: ${c_bad}invalid coverage mode=${mode:-missing} complete=${complete:-missing}${c_off}  (${swept:-?}MiB, HBM ${t}C)"
+            fails=$((fails + 1))
+        elif [ "$errs" -ne 0 ] || [ "${cok:-0}" -ne 1 ]; then
             say "  sweep $i: ${c_bad}mem_errors=$errs compute_ok=${cok:-?}  <- CORRUPTION${c_off}  (${swept:-?}MiB, HBM ${t}C)"; fails=$((fails + 1))
         else
             say "  sweep $i: ${c_ok}mem_errors=0 compute_ok=1${c_off}  (${swept:-?}MiB, HBM ${t}C)"
@@ -1316,7 +1355,7 @@ reject_hbm_profile() {
 }
 
 cmd_hbm_gate() {
-    local ndiv="" timings="" sweeps=4 workload="" normalized rc xids_before xids_after
+    local ndiv="" timings="" sweeps=4 workload="" normalized rc xids_before xids_after sweep_fraction_milli
     while [ $# -gt 0 ]; do
         case "$1" in
             --ndiv) ndiv=${2:?--ndiv needs a value}; shift 2 ;;
@@ -1329,6 +1368,8 @@ cmd_hbm_gate() {
     [ -n "$ndiv" ] || die "usage: hbm-gate --ndiv N [--timings \"FIELD VALUE ...\"] [--sweeps N] [--workload COMMAND]"
     [[ "$ndiv" =~ ^[0-9]+$ ]] || die "invalid NDIV '$ndiv'"
     [[ "$sweeps" =~ ^[0-9]+$ ]] && [ "$sweeps" -gt 0 ] || die "invalid sweep count '$sweeps'"
+    sweep_fraction_milli=$(fraction_to_milli "${SWEEP_FRAC:-0.95}") || die "invalid SWEEP_FRAC '${SWEEP_FRAC:-0.95}'"
+    [ "$sweep_fraction_milli" -ge 950 ] || die "hbm-gate qualification requires SWEEP_FRAC >= 0.95"
     is_170hx || die "refusing: GPU 0 is not a 170HX"
     [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
@@ -1359,7 +1400,8 @@ cmd_hbm_gate() {
     verify_hbm_profile "$ndiv" "$normalized" || { reject_hbm_profile "$normalized" "final readback failed"; return 1; }
     xids_after=$(xids || true); xids_after=${xids_after:-0}
     [ "$xids_after" -le "$xids_before" ] || { reject_hbm_profile "$normalized" "new Xid detected"; return 1; }
-    write_hbm_receipt "$ndiv" "$normalized" "$LAST_GATE_SWEEPS" "$LAST_GATE_PEAK_HBM" "$workload" "$rc" >/dev/null
+    write_hbm_receipt "$ndiv" "$normalized" "$LAST_GATE_SWEEPS" "$LAST_GATE_PEAK_HBM" \
+        "$workload" "$rc" "$LAST_GATE_SWEEP_MODE" "$LAST_GATE_SWEEP_FRAC_MILLI" >/dev/null
     say "${c_ok}HBM PROFILE QUALIFIED: NDIV $ndiv timings '$normalized' on card $(serial)${c_off}"
 }
 
@@ -2410,6 +2452,7 @@ ENVIRONMENT
   CTX_TIMEOUT=60        context probe timeout; a probe that hangs is treated as a wedge
   CTXPROBE=/path        the context probe (default: the ctx_probe installed here)
   BENCH=/path           the SM integrity sweep (default: the 170hx-sweep installed here)
+  SWEEP_FRAC=0.95       resident HBM sweep coverage; hbm-gate qualification requires >=0.95
   COMPUTE=/path         the compute checker        NVML=/path   nvml_oc
   MCLK_GATE_SOAK_MAX=360  soak budget for mclk-gate/mclk-ladder (mclk rungs cool faster)
   MCLK_TUNE=1            apply the per-NDIV timing tune during mclk-gate/ladder (extends 76->77)

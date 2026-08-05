@@ -302,7 +302,7 @@ WORKLOAD_TIMEOUT=900  'gate/hbm-gate --workload': a workload that hangs counts a
 CTX_TIMEOUT=60        context probe timeout; a probe that hangs is treated as a wedge
 CTXPROBE=/path        the context probe (default: the ctx_probe installed here)
 BENCH=/path           the SM integrity sweep (default: the 170hx-sweep installed here)
-SWEEP_FRAC=0.95       fraction of FREE VRAM 170hx-sweep writes and verifies
+SWEEP_FRAC=0.95       resident two-phase sweep coverage of FREE VRAM (hbm-gate requires >=0.95)
 COMPUTE=/path         the compute checker        NVML=/path        nvml_oc
 MCLK_GATE_SOAK_MAX=360  soak budget for mclk-gate/mclk-ladder (mclk rungs cool faster)
 MCLK_TUNE=1            apply the per-NDIV timing tune during mclk-gate/ladder (extends 76->77)

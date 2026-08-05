@@ -60,6 +60,10 @@ reset_controls() {
     control_set selftest_errors 0
     control_set selftest_compute_ok 1
     control_set selftest_swept_mib 8192
+    control_set selftest_complete 1
+    control_set selftest_mode resident-two-phase-v1
+    control_set selftest_result PASS
+    control_set selftest_rc 0
     control_set timing_set_rc 0
     control_set timing_ignore_set 0
     control_set timing_REFRESH 6
@@ -211,9 +215,11 @@ cat > "$TMP/bin/gpu_selftest" <<'STUB'
 #!/usr/bin/env bash
 c=${TEST_ROOT:?}/control
 printf 'gpu_selftest %s\n' "$*" >> "${TEST_ROOT}/calls.log"
-printf 'MEM_ERRORS=%s COMPUTE_OK=%s MEM_SWEPT_MIB=%s\n' \
+printf 'MEM_ERRORS=%s COMPUTE_OK=%s MEM_SWEPT_MIB=%s MEM_COMPLETE=%s MEM_SWEEP_MODE=%s RESULT=%s\n' \
     "$(cat "$c/selftest_errors")" "$(cat "$c/selftest_compute_ok")" \
-    "$(cat "$c/selftest_swept_mib")"
+    "$(cat "$c/selftest_swept_mib")" "$(cat "$c/selftest_complete")" \
+    "$(cat "$c/selftest_mode")" "$(cat "$c/selftest_result")"
+exit "$(cat "$c/selftest_rc")"
 STUB
 
 cat > "$TMP/bin/compute_check" <<'STUB'
@@ -269,6 +275,7 @@ run_tune() {
     GATE_SOAK_MAX=1 \
     MCLK_GATE_SOAK_MAX=1 \
     GATE_COMPUTE=1 \
+    SWEEP_FRAC="${SWEEP_FRAC:-0.95}" \
     SWEEP_TIMEOUT=10 \
     WORKLOAD_TIMEOUT=10 \
     CTX_TIMEOUT=10 \
@@ -346,6 +353,8 @@ test_exact_hbm_receipt_is_written_and_accepted() {
     assert_file_contains "$receipt" '"timings": "REFRESH 24"'
     assert_file_contains "$receipt" '"sweeps": 4'
     assert_file_contains "$receipt" '"peak_hbm_c": 65'
+    assert_file_contains "$receipt" '"sweep_mode": "resident-two-phase-v1"'
+    assert_file_contains "$receipt" '"sweep_fraction_milli": 950'
     assert_file_contains "$receipt" '"compute_check": true'
     assert_file_contains "$receipt" '"context_check": true'
     assert_file_contains "$receipt" '"workload_rc": 0'
@@ -413,6 +422,10 @@ test_hbm_receipt_contents_are_authoritative() {
 
     rewrite_receipt "$receipt" 's/"workload_rc": 0/"workload_rc": 1/'
     assert_receipt_rejected "receipt with failed workload was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"sweep_fraction_milli": 950/"sweep_fraction_milli": 1001/'
+    assert_receipt_rejected "receipt claiming more than 100 percent coverage was accepted"
     printf 'PASS: HBM receipt contents are authoritative\n'
 }
 
@@ -425,6 +438,14 @@ test_hbm_receipt_rejects_missing_required_fields() {
     receipt=$(write_valid_hbm_receipt)
     rewrite_receipt "$receipt" 's/"sweeps": 4,//'
     assert_receipt_rejected "receipt with no sweep count was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"sweep_mode": "resident-two-phase-v1",//'
+    assert_receipt_rejected "legacy receipt with no resident sweep mode was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"sweep_fraction_milli": 950,//'
+    assert_receipt_rejected "receipt with no sweep coverage was accepted"
 
     receipt=$(write_valid_hbm_receipt)
     rewrite_receipt "$receipt" 's/"workload": "true",//'
@@ -492,6 +513,16 @@ test_combined_hbm_gate_writes_exact_receipt() {
     printf 'PASS: combined HBM gate writes exact receipt\n'
 }
 
+test_hbm_gate_requires_at_least_95_percent_coverage() {
+    reset_controls
+    if SWEEP_FRAC=0.9499 run_tune hbm-gate --ndiv 70 --timings "REFRESH 24" \
+        --sweeps 4 --workload true >/dev/null 2>&1; then
+        fail "hbm-gate accepted SWEEP_FRAC below 0.95"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    printf 'PASS: HBM gate requires at least 95 percent sweep coverage\n'
+}
+
 run_rejected_hbm_gate() {
     rm -rf "$TMP/state/gated-hbm"
     set +e
@@ -525,6 +556,22 @@ test_combined_hbm_gate_rejects_and_reverts_failures() {
     reset_controls
     control_set selftest_compute_ok 0
     run_rejected_hbm_gate true "selftest compute mismatch"
+
+    reset_controls
+    control_set selftest_complete 0
+    run_rejected_hbm_gate true "incomplete resident sweep"
+
+    reset_controls
+    control_set selftest_mode legacy-sequential-v0
+    run_rejected_hbm_gate true "legacy nonresident sweep"
+
+    reset_controls
+    control_set selftest_result FAIL
+    run_rejected_hbm_gate true "selftest RESULT failure"
+
+    reset_controls
+    control_set selftest_rc 3
+    run_rejected_hbm_gate true "selftest nonzero exit"
 
     reset_controls
     printf '0\n2\n' > "$TMP/control/ctx_rc_sequence"
@@ -857,6 +904,7 @@ test_hbm_receipt_rejects_missing_required_fields
 test_hbm_receipt_rejects_ambiguous_or_malformed_records
 test_hbm_force_override_is_explicit
 test_combined_hbm_gate_writes_exact_receipt
+test_hbm_gate_requires_at_least_95_percent_coverage
 test_combined_hbm_gate_rejects_and_reverts_failures
 test_persist_rejects_nonstock_hbm_without_receipt
 test_persist_rejects_ambiguous_or_unrecoverable_timings

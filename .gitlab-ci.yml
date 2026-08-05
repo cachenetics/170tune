@@ -27,6 +27,8 @@ lint:
     - echo "== shellcheck -S warning =="
     - command -v shellcheck >/dev/null || { echo "shellcheck not installed on the runner"; exit 1; }
     - shellcheck -S warning $SCRIPTS
+    - bash tests/test_170tune.sh
+    - bash tests/test_hbm_test_step.sh
     - echo "all scripts parse and are shellcheck-clean at warning level"
 
 # --- build: compile every helper from source, exact installer flags, into a throwaway dir ------
@@ -45,6 +47,8 @@ build:
     - echo "== gcc tools =="
     - gcc -O2 -o "$out/hbm_mclk"  tools/hbm_mclk.c  && echo "ok hbm_mclk"
     - gcc -O2 -o "$out/fbpa_regs" tools/fbpa_regs.c && echo "ok fbpa_regs"
+    - g++ -std=c++11 -O2 -Wall -Wextra -pedantic -o "$out/resident_sweep_test" tests/resident_sweep_test.cpp
+    - "$out/resident_sweep_test"
     - |
       if [ -n "$cuda_root" ]; then inc="-I$cuda_root/include"; else inc=""; fi
       gcc -O2 -o "$out/nvml_oc" tools/nvml_oc.c $inc -lnvidia-ml && echo "ok nvml_oc"
