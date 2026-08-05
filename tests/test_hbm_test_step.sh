@@ -22,6 +22,12 @@ grep -Fq '170tune preflight' "$OUT"
 grep -Fq '170tune hbm-gate --ndiv 64 --sweeps 4' "$OUT"
 grep -Fq '170tune hbm-gate --ndiv 70 --timings "REFRESH 24" --sweeps 12' "$OUT"
 grep -Fq 'persist enable' "$OUT"
+if grep -Fq 'pci.link.gen.current' "$OUT"; then
+    printf 'FAIL: unsupported PCIe field pci.link.gen.current is still used\n' >&2
+    exit 1
+fi
+
+grep -Fq 'pcie.link.gen.gpucurrent' "$OUT"
 
 if grep -Fq 'systemctl reboot' "$OUT"; then
     printf 'FAIL: dry-run must not schedule a reboot\n' >&2

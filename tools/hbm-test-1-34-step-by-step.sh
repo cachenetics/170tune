@@ -210,7 +210,7 @@ start_telemetry() {
     (
         printf 'timestamp,name,serial,pstate,power_w,core_temp_c,mem_temp_c,sm_clock_mhz,mem_clock_mhz,util_gpu_pct,util_mem_pct,pcie_gen,pcie_width\n'
         while true; do
-            nvidia-smi --query-gpu=timestamp,name,serial,pstate,power.draw,temperature.gpu,temperature.memory,clocks.sm,clocks.mem,utilization.gpu,utilization.memory,pcie.link.gen.current,pcie.link.width.current \
+            nvidia-smi --query-gpu=timestamp,name,serial,pstate,power.draw,temperature.gpu,temperature.memory,clocks.sm,clocks.mem,utilization.gpu,utilization.memory,pcie.link.gen.gpucurrent,pcie.link.width.current \
                 --format=csv,noheader,nounits 2>/dev/null || true
             sleep 5
         done
@@ -566,7 +566,7 @@ run_cmd "$TUNE" mclk-status
 run_cmd "$TUNE" boot-apply
 run_cmd "$TUNE" mclk-status
 run_cmd "$TUNE" timings dump
-run_cmd nvidia-smi --query-gpu=name,serial,pstate,power.draw,temperature.gpu,temperature.memory,clocks.sm,clocks.mem,pci.link.gen.current,pci.link.width.current --format=csv,noheader
+run_cmd nvidia-smi --query-gpu=name,serial,pstate,power.draw,temperature.gpu,temperature.memory,clocks.sm,clocks.mem,pcie.link.gen.gpucurrent,pcie.link.width.current --format=csv,noheader
 
 step 12 "Optional enable; never reboot from this script"
 say "The service is still disabled. Enabling it changes the next boot path."
@@ -584,7 +584,7 @@ run_cmd "$TUNE" reset
 run_cmd "$TUNE" timings-stock
 run_cmd "$HBM_MCLK" set "$STOCK_NDIV"
 run_cmd "$TUNE" mclk-status
-run_cmd nvidia-smi --query-gpu=name,serial,pstate,power.draw,temperature.gpu,temperature.memory,memory.used,clocks.sm,clocks.mem,pci.link.gen.current,pci.link.width.current --format=csv,noheader
+run_cmd nvidia-smi --query-gpu=name,serial,pstate,power.draw,temperature.gpu,temperature.memory,memory.used,clocks.sm,clocks.mem,pcie.link.gen.gpucurrent,pcie.link.width.current --format=csv,noheader
 if [ "$DRY_RUN" -eq 0 ]; then
     XID_FINAL=$(count_xid)
     AER_FINAL=$(count_aer)
