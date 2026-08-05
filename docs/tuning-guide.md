@@ -450,8 +450,9 @@ Measured on the HBM matrix work (see `docs/hbm-matrix.md`): loosening the refres
 cuts idle power ~41 -> 35 W (-15%) and steady load power ~11-14% at every NDIV tested, with
 latency flat-to-better and no bandwidth cost - the retention margin at operating temperature is
 large. That is now the recommended idle/power lever, not an underclock: `170tune refresh gate`
-proves an interval hot on the target card, and `170tune persist save --timings "REFRESH <f>"`
-ships it. See `170tune explain-hbm` for the full retention/power/bandwidth model and the
+is useful while exploring an interval, but persistence requires the exact combined profile through
+`170tune hbm-gate --ndiv <N> --timings "REFRESH <f>" ...` before `persist save`. See
+`170tune explain-hbm` for the full retention/power/bandwidth model and the
 temperature caveat (retention margin shrinks with heat, so keep stock refresh for hot or
 unknown-thermal deployments).
 
@@ -520,8 +521,8 @@ What this establishes:
   2 TB/s (60-71C) yet dies on the first real serving load even started cool - the serving access
   pattern, not the temperature, is what its eye cannot take. An HBM point needs a real
   serving-workload rung run to thermal soak, with a
-  write/hold/read-back integrity check, before it can be called production-safe (the same
-  `gate --workload` discipline the SM side already uses).
+  write/hold/read-back integrity check, before it can be called production-safe. `hbm-gate`
+  implements that combined HBM profile and accepts the real serving command through `--workload`.
 - **Throttle vs corruption is the tell.** Stock DIPS then RECOVERS under heat (self-healing thermal
   throttle). The OC declines MONOTONICALLY and never recovers - that is silent memory corruption
   feeding MTP rejections (a flipped draft token fails verify -> extra full forward pass -> slower),
@@ -556,7 +557,7 @@ dangerous earlier because it had been stacked on an OC clock.
 
 ---
 
-## 7. Persistence and multi-card safety (persist model corrected 2026-08-03)
+## 7. Persistence and multi-card safety (receipt safety corrected 2026-08-05)
 
 Offsets, clock locks, and the HBM NDIV/timings/refresh writes are all volatile: lost on every
 driver reload and reboot. An earlier revision of this section described a per-profile
@@ -568,7 +569,12 @@ racing to apply state at boot. Persistence is now unified in `170tune` itself:
 ```
 170tune persist save --offset 200 --clk 1400      # an SM point (needs a passing gate receipt)
 170tune persist save --profile eff                # or a named profile, resolved to numbers here
-170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable HBM point (70 is the serving ceiling, not 76)
+WORKLOAD_TIMEOUT=28800 170tune hbm-gate \
+  --ndiv 70 \
+  --timings "REFRESH 24" \
+  --sweeps 12 \
+  --workload "/path/to/the/real/serving-soak.sh"
+170tune persist save --ndiv 70 --timings "REFRESH 24"
 170tune persist enable                             # installs + enables 170tune-persist.service
 170tune persist status                             # profile, service state, quarantine
 ```
@@ -580,6 +586,25 @@ profile is masked over ssh, never a brick. `persist save` for an SM point demand
 from THIS card (not quarantined, at least 4 hot sweeps, current memory clock, `-f`/`--force`
 overrides loudly); it also refuses outright if the driver's own memory clock is not genuinely
 stock (see the mclk misclassification guard in `170tune explain-hbm`).
+
+For HBM, only `hbm-gate` writes a persistence receipt for the exact combined NDIV/timing profile.
+That receipt also binds the card serial, PCI device ID, NVIDIA driver, and VBIOS, and records the
+hot sweep count, peak HBM temperature, compute/context checks, and optional workload result.
+`mclk-gate`, `timings-gate`, and `refresh gate` remain exploration tools; separate passes from
+those commands cannot be combined into persistence evidence. `persist save` validates the receipt,
+and `persist enable` validates it again before touching systemd.
+
+The full hot/full-VRAM/workload qualification is performed once for a fixed profile and software
+environment. `boot-apply` does not repeat it. Boot validates the receipt, applies each timing and
+NDIV with readback, runs the bounded CUDA context probe, and compares Xid counts before and after
+the apply. A failed receipt, write, readback, context, wedge, or new-Xid check restores stock and
+returns failure.
+
+Existing non-stock HBM configs from older releases remain on disk but have no exact-profile
+receipt. They will not be enabled or applied until the operator runs the printed `hbm-gate` command
+and saves again. A driver or VBIOS change likewise invalidates an old receipt. `--force` stores
+`HBM_FORCED=1` and is always labeled as an unqualified forced override; it is an expert escape
+hatch, not qualification evidence.
 
 A box still running the old `170hx-oc.service` model is migrated automatically the next time
 `170tune install` runs: it reads the old `/etc/170tune/profile`, resolves it to an offset/ceiling,
@@ -617,12 +642,15 @@ on another card. For the SM side:
 6. Record the result under `/var/lib/170tune/results/<serial>/` (`170tune qualify` does this),
    then persist the point deliberately with `170tune persist save` (section 7 above).
 
-For the HBM side, the equivalent flow is `170tune mclk-ladder` / `170tune mclk-gate`, covered in
-full in `170tune explain-hbm` and `docs/hbm-matrix.md`.
+For the HBM side, use `mclk-ladder`, `mclk-gate`, `timings-gate`, and `refresh gate` to explore.
+Before persistence, run one `hbm-gate --ndiv ... --timings ... --workload ...` against the exact
+combined profile; that is the only HBM flow which creates the per-card persistence receipt. The
+mechanics and test matrix are covered in `170tune explain-hbm` and `docs/hbm-matrix.md`.
 
-The gate is the pattern sweep, not "it ran". A silent corruptor (see the cliff in
-section 4) passes any test that only checks whether the kernel finished. Run 4 sweeps and
-prefer margin over a number that looks equal on paper.
+"It ran" is not qualification. A silent corruptor (see the cliff in section 4) passes any test
+that only checks whether the kernel finished. `hbm-gate` requires at least 4 hot full-VRAM sweeps,
+compute/context checks, and the requested workload; prefer margin over a number that looks equal
+on paper.
 
 ---
 
@@ -643,7 +671,8 @@ SM (this guide):
   silent COMPUTE corruption the memory sweep cannot see.
 - `tools/ctx_probe.cu`: the smallest proof the card is usable - create a context, allocate,
   launch, read back. Catches the wedge `nvidia-smi` cannot see (170tune `status`/`recover` and
-  the HBM gate paths all call it).
+  the HBM gate paths call it; `boot-apply` also runs it as a bounded quick check, without starting
+  a full-VRAM test).
 - `tools/mem_probe.cu`, `tools/gemm_probe.cu`: standalone streaming-bandwidth/latency and cublas
   GEMM-throughput probes, used for the datatype table in section 1.
 - `tools/170hx-soak`: repeats a workload for hours and fails on any new Xid - what actually
@@ -669,7 +698,7 @@ Boot/setup, all invoked through `170tune`, not run by hand:
   per-card stock-value snapshot, for standing this up on a card whose VBIOS differs from the
   reference card's hardcoded defaults.
 - `install_persist_unit` (inside `170tune`, not a separate script): generates
-  `/etc/systemd/system/170tune-persist.service` with the resolved tool paths baked in, so root
+  `/etc/systemd/system/170tune-persist.service` with the resolved HBM/NVML/context-probe paths baked in, so root
   running the unit at boot does not need `find_tool`'s `$HOME`-guessing fallback to work.
 
 Retired: the earlier `170hx-oc.service` static unit (superseded by the unified persist above,
