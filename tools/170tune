@@ -212,6 +212,18 @@ receipt_bool_field() {
         awk '{print $NF}'
 }
 
+hbm_receipt_structure_ok() {
+    local file=$1 compact key count
+    [ -f "$file" ] || return 1
+    compact=$(LC_ALL=C tr -d '[:space:]' < "$file")
+    case "$compact" in \{*\}) ;; *) return 1 ;; esac
+    for key in serial device_id driver_version vbios_version ndiv timings sweeps peak_hbm_c \
+               compute_check context_check workload workload_timeout workload_rc gated; do
+        count=$(grep -oE "\"${key}\"[[:space:]]*:" "$file" 2>/dev/null | wc -l | tr -d ' ')
+        [ "$count" = 1 ] || return 1
+    done
+}
+
 HBM_RECEIPT_FORCED=0
 hbm_receipt_gate() {
     local ndiv=${1:?ndiv} timings=${2:-} force=${3:-0} receipt normalized reason=""
@@ -226,6 +238,8 @@ hbm_receipt_gate() {
     rec_gated=$(receipt_string_field "$receipt" gated)
     if [ ! -f "$receipt" ]; then
         reason="no exact HBM gate receipt for NDIV $ndiv timings '$normalized' on card $(serial)"
+    elif ! hbm_receipt_structure_ok "$receipt"; then
+        reason="HBM gate receipt is malformed or has duplicate/missing fields"
     elif [ "$(receipt_string_field "$receipt" serial)" != "$(serial)" ]; then
         reason="HBM gate receipt serial does not match the installed card"
     elif [ "$(receipt_string_field "$receipt" device_id)" != "$(devid)" ]; then
@@ -256,8 +270,8 @@ hbm_receipt_gate() {
         reason="HBM gate receipt has no valid workload timeout"
     elif [ "$rec_workload_rc" != 0 ]; then
         reason="HBM gate receipt records a failed workload"
-    elif [ -z "$rec_gated" ]; then
-        reason="HBM gate receipt has no qualification timestamp"
+    elif ! [[ "$rec_gated" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$ ]]; then
+        reason="HBM gate receipt has no valid qualification timestamp"
     fi
     if [ -n "$reason" ]; then
         say "${c_bad}${reason}${c_off}"
@@ -1633,6 +1647,64 @@ sm_receipt_gate() {
     return 0
 }
 
+PERSIST_NDIV=""
+PERSIST_OFFSET=""
+PERSIST_CLK=""
+PERSIST_TIMINGS=""
+PERSIST_HBM_FORCED=0
+
+load_persist_config() {
+    local file=$1 line key value seen=""
+    PERSIST_NDIV=""; PERSIST_OFFSET=""; PERSIST_CLK=""; PERSIST_TIMINGS=""; PERSIST_HBM_FORCED=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in
+            NDIV=*)       key=NDIV;       value=${line#NDIV=} ;;
+            OFFSET=*)     key=OFFSET;     value=${line#OFFSET=} ;;
+            CLK=*)        key=CLK;        value=${line#CLK=} ;;
+            TIMINGS=*)    key=TIMINGS;    value=${line#TIMINGS=} ;;
+            HBM_FORCED=*) key=HBM_FORCED; value=${line#HBM_FORCED=} ;;
+            *) say "${c_bad}invalid persist config line: $line${c_off}"; return 1 ;;
+        esac
+        case " $seen " in *" $key "*)
+            say "${c_bad}duplicate persist config key: $key${c_off}"; return 1 ;;
+        esac
+        seen="$seen $key"
+        if [ "$key" = TIMINGS ]; then
+            case "$value" in
+                \"*\") value=${value#\"}; value=${value%\"} ;;
+                '') ;;
+                *) say "${c_bad}TIMINGS must be an empty value or one double-quoted line${c_off}"; return 1 ;;
+            esac
+        fi
+        case "$key" in
+            NDIV) PERSIST_NDIV=$value ;;
+            OFFSET) PERSIST_OFFSET=$value ;;
+            CLK) PERSIST_CLK=$value ;;
+            TIMINGS) PERSIST_TIMINGS=$value ;;
+            HBM_FORCED) PERSIST_HBM_FORCED=$value ;;
+        esac
+    done < "$file"
+}
+
+validate_persisted_sm() {
+    local off=${1:-} clk=${2:-}
+    if [ -z "$off" ] && [ -z "$clk" ]; then return 0; fi
+    [ -n "$off" ] && [ -n "$clk" ] || {
+        say "${c_bad}stored SM profile must contain both OFFSET and CLK${c_off}"
+        return 1
+    }
+    [[ "$off" =~ ^[+-]?[0-9]+$ ]] || {
+        say "${c_bad}stored SM OFFSET is invalid: '$off'${c_off}"
+        return 1
+    }
+    [[ "$clk" =~ ^[0-9]+$ ]] && [ "$clk" -gt 0 ] || {
+        say "${c_bad}stored SM CLK is invalid: '$clk'${c_off}"
+        return 1
+    }
+}
+
 validate_persisted_hbm() {
     local ndiv=${1:-} timings=${2:-} forced=${3:-0} normalized
     normalized=$(normalize_timings "$timings") || return 1
@@ -1690,6 +1762,7 @@ cmd_persist() {
                 [ -n "${off:-}" ] || die "unknown profile '$profname' - see '170tune --help' for the list, or use --offset/--clk directly"
                 say "resolved profile '$profname' -> offset +$off, ceiling $clk"
             fi
+            validate_persisted_sm "$off" "$clk" || die "refusing malformed SM profile"
             if [ -n "${off:-}" ] && [ -n "${clk:-}" ]; then
                 sm_receipt_gate "$off" "$clk" "$force" || die "refusing to persist an unproven SM point (see above); use --force to override"
             fi
@@ -1717,9 +1790,11 @@ cmd_persist() {
         enable)
             need_root persist enable
             [ -f "$PERSIST/$s.conf" ] || die "no profile for $s yet - run 'persist save' first"
-            local NDIV="" OFFSET="" CLK="" TIMINGS="" HBM_FORCED=0
-            # shellcheck disable=SC1090
-            . "$PERSIST/$s.conf"
+            load_persist_config "$PERSIST/$s.conf" || die "refusing malformed persist config"
+            local NDIV=$PERSIST_NDIV OFFSET=$PERSIST_OFFSET CLK=$PERSIST_CLK
+            local TIMINGS=$PERSIST_TIMINGS HBM_FORCED=$PERSIST_HBM_FORCED
+            validate_persisted_sm "$OFFSET" "$CLK" ||
+                die "refusing to enable a malformed stored SM profile"
             validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED" ||
                 die "refusing to enable a stored HBM profile without valid qualification evidence"
             install_persist_unit
@@ -1785,9 +1860,16 @@ cmd_boot_apply() {
             exit 0
         fi
     fi
-    local NDIV="" OFFSET="" CLK="" TIMINGS="" HBM_FORCED=0
-    # shellcheck disable=SC1090
-    . "$conf"
+    load_persist_config "$conf" || {
+        logger -t 170tune "boot-apply: malformed persist config; staying stock"
+        return 1
+    }
+    local NDIV=$PERSIST_NDIV OFFSET=$PERSIST_OFFSET CLK=$PERSIST_CLK
+    local TIMINGS=$PERSIST_TIMINGS HBM_FORCED=$PERSIST_HBM_FORCED
+    if ! validate_persisted_sm "$OFFSET" "$CLK"; then
+        logger -t 170tune "boot-apply: SM config validation failed; staying stock"
+        return 1
+    fi
     if ! validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED"; then
         logger -t 170tune "boot-apply: HBM receipt validation failed; staying stock"
         return 1

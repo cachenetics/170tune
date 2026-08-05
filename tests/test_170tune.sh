@@ -440,6 +440,22 @@ test_hbm_receipt_rejects_missing_required_fields() {
     printf 'PASS: HBM receipt rejects missing required fields\n'
 }
 
+test_hbm_receipt_rejects_ambiguous_or_malformed_records() {
+    reset_controls
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"ndiv": 70,/"ndiv": 70, "ndiv": 70,/'
+    assert_receipt_rejected "receipt with a duplicate authoritative key was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    printf 'trailing garbage\n' >> "$receipt"
+    assert_receipt_rejected "receipt with trailing garbage was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"gated": "2026-08-05T12:00:00+08:00"/"gated": "yesterday"/'
+    assert_receipt_rejected "receipt with an invalid qualification timestamp was accepted"
+    printf 'PASS: HBM receipt rejects ambiguous or malformed records\n'
+}
+
 test_hbm_force_override_is_explicit() {
     reset_controls
     rm -rf "$TMP/state/gated-hbm"
@@ -557,6 +573,17 @@ test_persist_rejects_ambiguous_or_unrecoverable_timings() {
         fail "forced timing without a stock rollback value was persisted"
     fi
     printf 'PASS: persist rejects ambiguous or unrecoverable timings\n'
+}
+
+test_persist_rejects_malformed_sm_profile() {
+    reset_controls
+    if run_tune persist save --offset 100 >/dev/null 2>&1; then
+        fail "persist save accepted an SM offset without a clock ceiling"
+    fi
+    if run_tune persist save --offset not-a-number --clk 1200 --force >/dev/null 2>&1; then
+        fail "persist save accepted a nonnumeric SM offset"
+    fi
+    printf 'PASS: persist rejects malformed SM profiles\n'
 }
 
 test_persist_records_qualified_hbm_profile() {
@@ -772,6 +799,35 @@ test_boot_apply_logs_forced_profile() {
     printf 'PASS: boot apply labels forced HBM profiles\n'
 }
 
+test_persist_config_is_parsed_as_data() {
+    reset_controls
+    rm -f "$TMP/config-executed" "$TMP/enable-config-executed"
+    cat > "$TMP/state/persist/TESTSERIAL.conf" <<EOF
+NDIV=64
+OFFSET=\$(touch "$TMP/config-executed")
+CLK=1200
+TIMINGS=""
+HBM_FORCED=0
+EOF
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "boot-apply accepted executable text in the persist config"
+    fi
+    [ ! -e "$TMP/config-executed" ] || fail "boot-apply executed persist config as shell"
+
+    cat > "$TMP/state/persist/TESTSERIAL.conf" <<EOF
+NDIV=64
+OFFSET=\$(touch "$TMP/enable-config-executed")
+CLK=1200
+TIMINGS=""
+HBM_FORCED=0
+EOF
+    if run_tune persist enable >/dev/null 2>&1; then
+        fail "persist enable accepted executable text in the persist config"
+    fi
+    [ ! -e "$TMP/enable-config-executed" ] || fail "persist enable executed persist config as shell"
+    printf 'PASS: persist configs are parsed as data, not shell\n'
+}
+
 test_boot_apply_keeps_old_sm_only_profile_compatible() {
     reset_controls
     cat > "$TMP/state/persist/TESTSERIAL.conf" <<'EOF'
@@ -798,11 +854,13 @@ test_missing_hbm_receipt_is_rejected
 test_exact_hbm_receipt_is_written_and_accepted
 test_hbm_receipt_contents_are_authoritative
 test_hbm_receipt_rejects_missing_required_fields
+test_hbm_receipt_rejects_ambiguous_or_malformed_records
 test_hbm_force_override_is_explicit
 test_combined_hbm_gate_writes_exact_receipt
 test_combined_hbm_gate_rejects_and_reverts_failures
 test_persist_rejects_nonstock_hbm_without_receipt
 test_persist_rejects_ambiguous_or_unrecoverable_timings
+test_persist_rejects_malformed_sm_profile
 test_persist_records_qualified_hbm_profile
 test_persist_marks_forced_hbm_profile
 test_persist_keeps_sm_only_and_stock_hbm_compatible
@@ -816,4 +874,5 @@ test_boot_apply_rejects_ndiv_pll_context_and_runtime_faults
 test_boot_apply_ignores_historical_xids
 test_boot_apply_rejects_stale_receipt_before_writes
 test_boot_apply_logs_forced_profile
+test_persist_config_is_parsed_as_data
 test_boot_apply_keeps_old_sm_only_profile_compatible
