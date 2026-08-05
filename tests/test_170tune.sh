@@ -18,9 +18,20 @@ assert_contains() {
     esac
 }
 
+assert_eq() {
+    [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
+}
+
 assert_file_contains() {
     [ -f "$1" ] || fail "missing file: $1"
     grep -Fq "$2" "$1" || fail "expected '$2' in $1"
+}
+
+assert_file_not_contains() {
+    [ -f "$1" ] || fail "missing file: $1"
+    if grep -Fq "$2" "$1"; then
+        fail "did not expect '$2' in $1"
+    fi
 }
 
 control_set() {
@@ -67,6 +78,11 @@ cat > "$TMP/bin/timeout" <<'STUB'
 #!/usr/bin/env bash
 shift
 exec "$@"
+STUB
+
+cat > "$TMP/bin/sync" <<'STUB'
+#!/usr/bin/env bash
+exit 0
 STUB
 
 cat > "$TMP/bin/nvidia-smi" <<'STUB'
@@ -234,4 +250,143 @@ EOF
     printf 'PASS: path overrides isolate state\n'
 }
 
+test_hbm_profile_identity_is_canonical() {
+    reset_controls
+    id1=$(run_tune receipt-test id 70 "REFRESH 24 RAS 43" 2>/dev/null) ||
+        fail "receipt-test id rejected a valid profile"
+    id2=$(run_tune receipt-test id 70 "ras 43 refresh 24" 2>/dev/null) ||
+        fail "receipt-test id rejected reordered timings"
+    assert_eq "$id1" "$id2"
+    case "$id1" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) fail "invalid HBM profile id: $id1" ;;
+    esac
+    printf 'PASS: HBM profile identity is canonical\n'
+}
+
+test_hbm_profile_rejects_malformed_timings() {
+    reset_controls
+    if run_tune receipt-test id 70 "REFRESH" >/dev/null 2>&1; then
+        fail "odd timing token count was accepted"
+    fi
+    if run_tune receipt-test id 70 "REFRESH fast" >/dev/null 2>&1; then
+        fail "nonnumeric timing value was accepted"
+    fi
+    if run_tune receipt-test id 70 "9BAD 24" >/dev/null 2>&1; then
+        fail "invalid timing field was accepted"
+    fi
+    if run_tune receipt-test id 70 "REFRESH 24 refresh 25" >/dev/null 2>&1; then
+        fail "duplicate timing field was accepted"
+    fi
+    printf 'PASS: malformed HBM timings are rejected\n'
+}
+
+test_missing_hbm_receipt_is_rejected() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    set +e
+    output=$(run_tune receipt-test validate 70 "REFRESH 24" 2>&1)
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "missing HBM receipt was accepted"
+    assert_contains "$output" "no exact HBM gate receipt"
+    printf 'PASS: missing HBM receipt is rejected\n'
+}
+
+test_exact_hbm_receipt_is_written_and_accepted() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune receipt-test write 70 "REFRESH 24" 4 65 true 0 >/dev/null
+    run_tune receipt-test validate 70 "REFRESH 24" >/dev/null
+    receipt=$(find "$TMP/state/gated-hbm/TESTSERIAL" -name '*.json' -type f | head -1)
+    [ -n "$receipt" ] || fail "HBM receipt was not written"
+    assert_file_contains "$receipt" '"device_id": "0x2082"'
+    assert_file_contains "$receipt" '"driver_version": "610.43.03"'
+    assert_file_contains "$receipt" '"vbios_version": "92.00.6D.00.0A"'
+    assert_file_contains "$receipt" '"ndiv": 70'
+    assert_file_contains "$receipt" '"timings": "REFRESH 24"'
+    assert_file_contains "$receipt" '"sweeps": 4'
+    assert_file_contains "$receipt" '"peak_hbm_c": 65'
+    assert_file_contains "$receipt" '"compute_check": true'
+    assert_file_contains "$receipt" '"context_check": true'
+    assert_file_contains "$receipt" '"workload_rc": 0'
+    assert_file_not_contains "$receipt" '"gated": ""'
+    printf 'PASS: exact HBM receipt is written and accepted\n'
+}
+
+write_valid_hbm_receipt() {
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune receipt-test write 70 "REFRESH 24" 4 65 true 0 >/dev/null
+    find "$TMP/state/gated-hbm/TESTSERIAL" -name '*.json' -type f | head -1
+}
+
+assert_receipt_rejected() {
+    if run_tune receipt-test validate 70 "REFRESH 24" >/dev/null 2>&1; then
+        fail "$1"
+    fi
+}
+
+rewrite_receipt() {
+    sed "$2" "$1" > "$1.tmp"
+    mv "$1.tmp" "$1"
+}
+
+test_hbm_receipt_contents_are_authoritative() {
+    reset_controls
+    receipt=$(write_valid_hbm_receipt)
+
+    control_set driver 611.00
+    assert_receipt_rejected "receipt from another driver was accepted"
+    control_set driver 610.43.03
+
+    control_set vbios 92.00.BAD
+    assert_receipt_rejected "receipt from another VBIOS was accepted"
+    control_set vbios 92.00.6D.00.0A
+
+    control_set devid 0x20c2
+    assert_receipt_rejected "receipt from another device ID was accepted"
+    control_set devid 0x2082
+
+    rewrite_receipt "$receipt" 's/"sweeps": 4/"sweeps": 3/'
+    assert_receipt_rejected "thin HBM receipt was accepted"
+    receipt=$(write_valid_hbm_receipt)
+
+    rewrite_receipt "$receipt" 's/"peak_hbm_c": 65/"peak_hbm_c": 59/'
+    assert_receipt_rejected "cold HBM receipt was accepted"
+    receipt=$(write_valid_hbm_receipt)
+
+    rewrite_receipt "$receipt" 's/"compute_check": true/"compute_check": false/'
+    assert_receipt_rejected "receipt without compute proof was accepted"
+    receipt=$(write_valid_hbm_receipt)
+
+    rewrite_receipt "$receipt" 's/"context_check": true/"context_check": false/'
+    assert_receipt_rejected "receipt without context proof was accepted"
+    receipt=$(write_valid_hbm_receipt)
+
+    rewrite_receipt "$receipt" 's/"workload_rc": 0/"workload_rc": 1/'
+    assert_receipt_rejected "receipt with failed workload was accepted"
+    printf 'PASS: HBM receipt contents are authoritative\n'
+}
+
+test_hbm_force_override_is_explicit() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    output=$(run_tune receipt-test validate-force 70 "REFRESH 24" 2>&1) ||
+        fail "explicit HBM force override was rejected"
+    assert_contains "$output" "FORCED HBM persistence"
+    assert_contains "$output" "forced=1"
+
+    write_valid_hbm_receipt >/dev/null
+    output=$(run_tune receipt-test validate-force 70 "REFRESH 24" 2>&1) ||
+        fail "valid HBM receipt was rejected with force available"
+    assert_contains "$output" "forced=0"
+    printf 'PASS: HBM force override is explicit\n'
+}
+
 test_path_overrides_isolate_state
+test_hbm_profile_identity_is_canonical
+test_hbm_profile_rejects_malformed_timings
+test_missing_hbm_receipt_is_rejected
+test_exact_hbm_receipt_is_written_and_accepted
+test_hbm_receipt_contents_are_authoritative
+test_hbm_force_override_is_explicit

@@ -106,6 +106,154 @@ serial() { nvidia-smi --query-gpu=serial --format=csv,noheader 2>/dev/null | hea
 devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
 xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
 
+# Canonical HBM profile identity. Persistence receipts must describe the exact
+# combined NDIV/timing state, independent of argument order or field case.
+normalize_timings() {
+    local raw=${1:-} field value records="" seen=""
+    [ -n "$raw" ] || { printf '\n'; return 0; }
+    # Intentional word splitting: the CLI format is FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $raw
+    [ $(( $# % 2 )) -eq 0 ] || { printf 'timings must be FIELD VALUE pairs\n' >&2; return 1; }
+    while [ $# -gt 0 ]; do
+        field=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+        value=$2
+        shift 2
+        [[ "$field" =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'invalid timing field: %s\n' "$field" >&2; return 1; }
+        [[ "$value" =~ ^[0-9]+$ ]] || { printf 'invalid timing value for %s: %s\n' "$field" "$value" >&2; return 1; }
+        case " $seen " in
+            *" $field "*) printf 'duplicate timing field: %s\n' "$field" >&2; return 1 ;;
+        esac
+        seen="$seen $field"
+        records="${records}${field} ${value}\n"
+    done
+    printf '%b' "$records" | LC_ALL=C sort -k1,1 | awk '
+        BEGIN { sep = "" }
+        { printf "%s%s %s", sep, $1, $2; sep = " " }
+        END { print "" }
+    '
+}
+
+hbm_profile_id() {
+    local ndiv=${1:-} timings=${2:-} normalized digest
+    [[ "$ndiv" =~ ^[0-9]+$ ]] || { printf 'invalid NDIV: %s\n' "$ndiv" >&2; return 1; }
+    normalized=$(normalize_timings "$timings") || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf 'ndiv=%s;timings=%s' "$ndiv" "$normalized" | sha256sum | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf 'ndiv=%s;timings=%s' "$ndiv" "$normalized" | shasum -a 256 | awk '{print $1}')
+    else
+        printf 'sha256sum or shasum is required\n' >&2
+        return 1
+    fi
+    printf '%.16s\n' "$digest"
+}
+
+driver_version() { nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+vbios_version()  { nvidia-smi --query-gpu=vbios_version  --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+
+hbm_receipt_file() {
+    local ndiv=${1:?ndiv} timings=${2:-} profile_id
+    profile_id=$(hbm_profile_id "$ndiv" "$timings") || return 1
+    printf '%s/gated-hbm/%s/%s.json' "$STATE" "$(serial)" "$profile_id"
+}
+
+json_escape() {
+    local value=${1:-}
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    printf '%s' "$value"
+}
+
+iso_timestamp() {
+    date -Is 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+write_hbm_receipt() {
+    local ndiv=${1:?ndiv} timings=${2:-} sweeps=${3:?sweeps} peak=${4:?peak_hbm_c}
+    local workload=${5:-} workload_rc=${6:-0} normalized receipt workload_json
+    normalized=$(normalize_timings "$timings") || return 1
+    receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
+    mkdir -p "$(dirname "$receipt")"
+    if [ -n "$workload" ]; then
+        workload_json="\"$(json_escape "$workload")\""
+    else
+        workload_json=null
+    fi
+    cat > "$receipt" <<EOF
+{"serial": "$(json_escape "$(serial)")", "device_id": "$(json_escape "$(devid)")",
+ "driver_version": "$(json_escape "$(driver_version)")", "vbios_version": "$(json_escape "$(vbios_version)")",
+ "ndiv": $ndiv, "timings": "$(json_escape "$normalized")", "sweeps": $sweeps, "peak_hbm_c": $peak,
+ "compute_check": true, "context_check": true, "workload": $workload_json,
+ "workload_timeout": ${WORKLOAD_TIMEOUT:-0}, "workload_rc": $workload_rc, "gated": "$(iso_timestamp)"}
+EOF
+    sync
+    printf '%s\n' "$receipt"
+}
+
+receipt_string_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *\"[^\"]*\"" "$file" 2>/dev/null | head -1 |
+        sed -E 's/^[^:]+: *"([^"]*)"$/\1/'
+}
+
+receipt_number_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *-?[0-9]+" "$file" 2>/dev/null | head -1 |
+        grep -oE -- '-?[0-9]+$'
+}
+
+receipt_bool_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *(true|false)" "$file" 2>/dev/null | head -1 |
+        awk '{print $NF}'
+}
+
+HBM_RECEIPT_FORCED=0
+hbm_receipt_gate() {
+    local ndiv=${1:?ndiv} timings=${2:-} force=${3:-0} receipt normalized reason=""
+    HBM_RECEIPT_FORCED=0
+    normalized=$(normalize_timings "$timings") || return 1
+    receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
+    if [ ! -f "$receipt" ]; then
+        reason="no exact HBM gate receipt for NDIV $ndiv timings '$normalized' on card $(serial)"
+    elif [ "$(receipt_string_field "$receipt" serial)" != "$(serial)" ]; then
+        reason="HBM gate receipt serial does not match the installed card"
+    elif [ "$(receipt_string_field "$receipt" device_id)" != "$(devid)" ]; then
+        reason="HBM gate receipt device ID does not match the installed card"
+    elif [ "$(receipt_string_field "$receipt" driver_version)" != "$(driver_version)" ]; then
+        reason="HBM gate receipt driver version does not match the running driver"
+    elif [ "$(receipt_string_field "$receipt" vbios_version)" != "$(vbios_version)" ]; then
+        reason="HBM gate receipt VBIOS version does not match the installed card"
+    elif [ "$(receipt_number_field "$receipt" ndiv)" != "$ndiv" ]; then
+        reason="HBM gate receipt NDIV does not match the requested profile"
+    elif [ "$(receipt_string_field "$receipt" timings)" != "$normalized" ]; then
+        reason="HBM gate receipt timings do not match the requested profile"
+    elif [ "${GATE_TEMP:-60}" -gt "$(receipt_number_field "$receipt" peak_hbm_c)" ] 2>/dev/null; then
+        reason="HBM gate receipt is cold (peak below ${GATE_TEMP:-60}C)"
+    elif [ "$(receipt_number_field "$receipt" sweeps)" -lt 4 ] 2>/dev/null; then
+        reason="HBM gate receipt has fewer than four hot sweeps"
+    elif [ "$(receipt_bool_field "$receipt" compute_check)" != true ]; then
+        reason="HBM gate receipt has no passing compute check"
+    elif [ "$(receipt_bool_field "$receipt" context_check)" != true ]; then
+        reason="HBM gate receipt has no passing CUDA context check"
+    elif [ "$(receipt_number_field "$receipt" workload_rc)" != 0 ]; then
+        reason="HBM gate receipt records a failed workload"
+    fi
+    if [ -n "$reason" ]; then
+        say "${c_bad}${reason}${c_off}"
+        [ "$force" = 1 ] || return 1
+        HBM_RECEIPT_FORCED=1
+        say "${c_warn}FORCED HBM persistence: proceeding without qualification evidence${c_off}"
+        return 0
+    fi
+    say "${c_ok}exact HBM gate receipt accepted: $receipt${c_off}"
+    return 0
+}
+
 is_170hx() {
     local d p; d="$(devid)"
     for p in $DEVID_170HX_PATTERNS; do
@@ -2008,5 +2156,20 @@ case "${1:-}" in
     install)         shift; need_root install "$@"; cmd_install "$@" ;;
     preflight)        shift; cmd_preflight "$@" ;;
     snapshot-stock)   shift; need_root snapshot-stock "$@"; cmd_snapshot_stock "$@" ;;
+    receipt-test)
+        [ "${TUNE_TEST_MODE:-}" = 1 ] || die "receipt-test is test-only"
+        shift
+        case "${1:-}" in
+            id) shift; hbm_profile_id "${1:?ndiv}" "${2:-}" ;;
+            validate) shift; hbm_receipt_gate "${1:?ndiv}" "${2:-}" 0 ;;
+            validate-force)
+                shift
+                hbm_receipt_gate "${1:?ndiv}" "${2:-}" 1
+                printf 'forced=%s\n' "$HBM_RECEIPT_FORCED"
+                ;;
+            write) shift; write_hbm_receipt "${1:?ndiv}" "${2:-}" "${3:?sweeps}" "${4:?peak}" "${5:-}" "${6:-0}" ;;
+            *) die "usage: receipt-test {id|validate|validate-force|write} <ndiv> <timings> ..." ;;
+        esac
+        ;;
     *) cmd_help; exit 2 ;;
 esac
