@@ -33,7 +33,7 @@ set -uo pipefail
 # real tools resolve from /usr/local/bin first anyway).
 : "${HOME:=/root}"
 
-STATE=/var/lib/170tune
+STATE=${STATE:-/var/lib/170tune}
 # Paths must survive sudo, where $HOME becomes /root. Resolve against the INVOKING user's home.
 user_home() { getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6; }
 find_tool() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
@@ -89,8 +89,8 @@ STOCK_TIMINGS=${STOCK_TIMINGS:-"RC:67 RFC:657 RAS:43 RP:24 RD_RCD:27 WR_RCD:18 W
 # to hold stock ns, + bus-turnaround 8->12 + CDLR 9->13). This is what extends the robust ceiling past
 # the bare limit (measured 76 bare -> 77 tuned), deterministically, with no DDLL recal.
 MCLK_TUNE=${MCLK_TUNE:-}
-PERSIST=/var/lib/170tune/persist
-PERSIST_UNIT=/etc/systemd/system/170tune-persist.service
+PERSIST=${PERSIST:-$STATE/persist}
+PERSIST_UNIT=${PERSIST_UNIT:-/etc/systemd/system/170tune-persist.service}
 # Both shipped 170HX SKUs: 8GB (0x20C2, 64GB unlock) and 10GB (0x2082, 40GB unlock). A 16GB ROM
 # exists but was never shipped, so it is deliberately not matched here.
 DEVID_170HX_PATTERNS="20c2 2082"
