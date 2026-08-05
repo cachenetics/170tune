@@ -215,9 +215,15 @@ receipt_bool_field() {
 HBM_RECEIPT_FORCED=0
 hbm_receipt_gate() {
     local ndiv=${1:?ndiv} timings=${2:-} force=${3:-0} receipt normalized reason=""
+    local rec_peak rec_sweeps rec_timeout rec_workload_rc rec_gated
     HBM_RECEIPT_FORCED=0
     normalized=$(normalize_timings "$timings") || return 1
     receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
+    rec_peak=$(receipt_number_field "$receipt" peak_hbm_c)
+    rec_sweeps=$(receipt_number_field "$receipt" sweeps)
+    rec_timeout=$(receipt_number_field "$receipt" workload_timeout)
+    rec_workload_rc=$(receipt_number_field "$receipt" workload_rc)
+    rec_gated=$(receipt_string_field "$receipt" gated)
     if [ ! -f "$receipt" ]; then
         reason="no exact HBM gate receipt for NDIV $ndiv timings '$normalized' on card $(serial)"
     elif [ "$(receipt_string_field "$receipt" serial)" != "$(serial)" ]; then
@@ -232,16 +238,26 @@ hbm_receipt_gate() {
         reason="HBM gate receipt NDIV does not match the requested profile"
     elif [ "$(receipt_string_field "$receipt" timings)" != "$normalized" ]; then
         reason="HBM gate receipt timings do not match the requested profile"
-    elif [ "${GATE_TEMP:-60}" -gt "$(receipt_number_field "$receipt" peak_hbm_c)" ] 2>/dev/null; then
+    elif ! [[ "$rec_peak" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid peak temperature"
+    elif [ "${GATE_TEMP:-60}" -gt "$rec_peak" ]; then
         reason="HBM gate receipt is cold (peak below ${GATE_TEMP:-60}C)"
-    elif [ "$(receipt_number_field "$receipt" sweeps)" -lt 4 ] 2>/dev/null; then
+    elif ! [[ "$rec_sweeps" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid sweep count"
+    elif [ "$rec_sweeps" -lt 4 ]; then
         reason="HBM gate receipt has fewer than four hot sweeps"
     elif [ "$(receipt_bool_field "$receipt" compute_check)" != true ]; then
         reason="HBM gate receipt has no passing compute check"
     elif [ "$(receipt_bool_field "$receipt" context_check)" != true ]; then
         reason="HBM gate receipt has no passing CUDA context check"
-    elif [ "$(receipt_number_field "$receipt" workload_rc)" != 0 ]; then
+    elif ! grep -qE '"workload": *(null|")' "$receipt" 2>/dev/null; then
+        reason="HBM gate receipt has no valid workload record"
+    elif ! [[ "$rec_timeout" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid workload timeout"
+    elif [ "$rec_workload_rc" != 0 ]; then
         reason="HBM gate receipt records a failed workload"
+    elif [ -z "$rec_gated" ]; then
+        reason="HBM gate receipt has no qualification timestamp"
     fi
     if [ -n "$reason" ]; then
         say "${c_bad}${reason}${c_off}"
@@ -1537,6 +1553,8 @@ Type=oneshot
 Environment=HBM_MCLK=$HBM_MCLK
 Environment=FBPA_REGS=$FBPA_REGS
 Environment=NVML=$NVML
+Environment=CTXPROBE=$CTXPROBE
+Environment=CTX_TIMEOUT=$CTX_TIMEOUT
 ExecStart=$SELF boot-apply
 RemainAfterExit=no
 
@@ -1615,6 +1633,35 @@ sm_receipt_gate() {
     return 0
 }
 
+validate_persisted_hbm() {
+    local ndiv=${1:-} timings=${2:-} forced=${3:-0} normalized
+    normalized=$(normalize_timings "$timings") || return 1
+    [ -z "$normalized" ] || [ -n "$ndiv" ] || {
+        say "${c_bad}stored HBM timings have no NDIV; the combined profile cannot be identified${c_off}"
+        return 1
+    }
+    [ -z "$ndiv" ] || [[ "$ndiv" =~ ^[0-9]+$ ]] || {
+        say "${c_bad}stored HBM NDIV is invalid: '$ndiv'${c_off}"
+        return 1
+    }
+    case "$forced" in 0|1) ;; *)
+        say "${c_bad}stored HBM_FORCED marker is invalid: '$forced'${c_off}"
+        return 1
+    esac
+    if { [ -z "$ndiv" ] || [ "$ndiv" = "$STOCK_NDIV" ]; } && [ -z "$normalized" ]; then
+        return 0
+    fi
+    validate_rollbackable_timings "$normalized" || return 1
+    if [ "$forced" = 1 ]; then
+        say "${c_warn}FORCED HBM profile: accepting explicit unqualified override${c_off}"
+        return 0
+    fi
+    hbm_receipt_gate "$ndiv" "$normalized" 0 || {
+        say "  qualify this exact profile first: 170tune hbm-gate --ndiv $ndiv${normalized:+ --timings \"$normalized\"}"
+        return 1
+    }
+}
+
 # HARDWARE-TEST-GATED SECTION (persist unification). cmd_persist is the single unified
 # persistence command for BOTH the SM point (offset/clk) and the HBM point (NDIV/timings) - one
 # conf per serial under $PERSIST, one systemd unit (170tune-persist.service via boot-apply below)
@@ -1630,7 +1677,7 @@ cmd_persist() {
             [ -n "$s" ] || die "no serial - is a card installed?"
             refuse_if_mclk_baked "persist save"
             mkdir -p "$PERSIST"
-            local ndiv="" off="" clk="" tim="" profname="" force=0
+            local ndiv="" off="" clk="" tim="" profname="" force=0 hbm_forced=0
             while [ $# -ge 1 ]; do case "$1" in
                 --ndiv) ndiv=$2; shift 2 ;; --offset) off=$2; shift 2 ;;
                 --clk) clk=$2; shift 2 ;; --timings) tim=$2; shift 2 ;;
@@ -1646,8 +1693,22 @@ cmd_persist() {
             if [ -n "${off:-}" ] && [ -n "${clk:-}" ]; then
                 sm_receipt_gate "$off" "$clk" "$force" || die "refusing to persist an unproven SM point (see above); use --force to override"
             fi
-            { echo "# 170tune persist profile for $s ($(date -Is)) - only GATED values belong here"
-              echo "NDIV=${ndiv}"; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS=\"${tim}\""
+            tim=$(normalize_timings "$tim") || die "refusing malformed HBM timings"
+            [ -z "$tim" ] || [ -n "$ndiv" ] ||
+                die "--timings requires --ndiv so the exact combined HBM profile can be qualified"
+            [ -z "$ndiv" ] || [[ "$ndiv" =~ ^[0-9]+$ ]] || die "invalid NDIV '$ndiv'"
+            validate_rollbackable_timings "$tim" || die "refusing HBM timings without a stock rollback value"
+            if { [ -n "$ndiv" ] && [ "$ndiv" != "$STOCK_NDIV" ]; } || [ -n "$tim" ]; then
+                hbm_receipt_gate "$ndiv" "$tim" "$force" ||
+                    die "refusing to persist an unqualified HBM profile; run: 170tune hbm-gate --ndiv $ndiv${tim:+ --timings \"$tim\"}"
+                hbm_forced=$HBM_RECEIPT_FORCED
+            fi
+            { if [ "$hbm_forced" = 1 ]; then
+                  echo "# 170tune persist profile for $s ($(date -Is)) - unqualified forced HBM override"
+              else
+                  echo "# 170tune persist profile for $s ($(date -Is)) - only GATED values belong here"
+              fi
+              echo "NDIV=${ndiv}"; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS=\"${tim}\""; echo "HBM_FORCED=${hbm_forced}"
               [ -n "$profname" ] && echo "# profile: $profname"
             } > "$PERSIST/$s.conf"
             say "${c_ok}saved $PERSIST/$s.conf${c_off}"; sed 's/^/   /' "$PERSIST/$s.conf"
@@ -1656,9 +1717,18 @@ cmd_persist() {
         enable)
             need_root persist enable
             [ -f "$PERSIST/$s.conf" ] || die "no profile for $s yet - run 'persist save' first"
+            local NDIV="" OFFSET="" CLK="" TIMINGS="" HBM_FORCED=0
+            # shellcheck disable=SC1090
+            . "$PERSIST/$s.conf"
+            validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED" ||
+                die "refusing to enable a stored HBM profile without valid qualification evidence"
             install_persist_unit
             systemctl daemon-reload; systemctl enable 170tune-persist.service >/dev/null 2>&1
-            say "${c_ok}170tune-persist.service enabled - the qualified profile re-applies each boot${c_off}"
+            if [ "$HBM_FORCED" = 1 ]; then
+                say "${c_warn}170tune-persist.service enabled - the unqualified forced HBM override re-applies each boot${c_off}"
+            else
+                say "${c_ok}170tune-persist.service enabled - the qualified profile re-applies each boot${c_off}"
+            fi
             say "  recover remotely if a profile misbehaves: systemctl mask 170tune-persist.service (boot stays stock)"
             ;;
         disable)
@@ -1675,6 +1745,17 @@ cmd_persist() {
             fi
             ;;
     esac
+}
+
+revert_boot_profile() {
+    local reason=${1:-runtime-health-failure} timings=${2:-}
+    logger -t 170tune "boot-apply: $reason; reverting to stock"
+    "$NVML" 0 0 >/dev/null 2>&1 || true
+    nvidia-smi -rgc >/dev/null 2>&1 || true
+    mclk_revert
+    restore_hbm_timings "$timings" || true
+    disarm
+    return 1
 }
 
 # ExecStart of the persist service. Self-disarming: if a marker from a PRIOR boot
@@ -1704,33 +1785,49 @@ cmd_boot_apply() {
             exit 0
         fi
     fi
+    local NDIV="" OFFSET="" CLK="" TIMINGS="" HBM_FORCED=0
     # shellcheck disable=SC1090
     . "$conf"
-    arm "persist-$s" "${NDIV:-0}"
-    logger -t 170tune "boot-apply: applying $s NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
-    [ -n "${OFFSET:-}" ] && "$NVML" "${OFFSET}" 0 >/dev/null 2>&1
-    [ -n "${CLK:-}" ] && nvidia-smi -lgc "210,${CLK}" >/dev/null 2>&1
-    if [ -n "${TIMINGS:-}" ] && [ -x "$FBPA_REGS" ]; then
-        # shellcheck disable=SC2086
-        set -- ${TIMINGS}; while [ $# -ge 2 ]; do "$FBPA_REGS" set "$1" "$2" >/dev/null 2>&1; shift 2; done
+    if ! validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED"; then
+        logger -t 170tune "boot-apply: HBM receipt validation failed; staying stock"
+        return 1
     fi
-    if [ -n "${NDIV:-}" ] && [ "${NDIV}" != "$STOCK_NDIV" ] && [ -x "$HBM_MCLK" ]; then
-        if "$HBM_MCLK" set "${NDIV}" >/dev/null 2>&1; then
-            # Bare NDIV by default (robust). The DDLL recal is opt-in and non-deterministic; only
-            # apply it when the persisted profile is a recal-extended (>bare-ceiling) point.
-            [ -n "${MCLK_RECAL:-}" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
-        else
-            logger -t 170tune "boot-apply: NDIV ${NDIV} did not lock; left stock"
+    local xids_before xids_after hbm_state=stock
+    if { [ -n "$NDIV" ] && [ "$NDIV" != "$STOCK_NDIV" ]; } || [ -n "$TIMINGS" ]; then
+        if [ "$HBM_FORCED" = 1 ]; then hbm_state=forced; else hbm_state=qualified; fi
+    fi
+    xids_before=$(xids || true); xids_before=${xids_before:-0}
+    arm "persist-$s" "${NDIV:-0}"
+    logger -t 170tune "boot-apply: applying $s HBM=$hbm_state NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
+    if [ -n "${OFFSET:-}" ] && ! "$NVML" "${OFFSET}" 0 >/dev/null 2>&1; then
+        revert_boot_profile "SM offset apply failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "${CLK:-}" ] && ! nvidia-smi -lgc "210,${CLK}" >/dev/null 2>&1; then
+        revert_boot_profile "SM clock-lock apply failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "$TIMINGS" ] && ! apply_hbm_timings "$TIMINGS"; then
+        revert_boot_profile "HBM timing apply/readback failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "$NDIV" ] && [ "$NDIV" != "$STOCK_NDIV" ]; then
+        if [ ! -x "$HBM_MCLK" ] || ! "$HBM_MCLK" set "$NDIV" >/dev/null 2>&1; then
+            revert_boot_profile "HBM NDIV $NDIV failed to lock" "$TIMINGS"; return 1
         fi
+        # Bare NDIV by default (robust). The DDLL recal is opt-in and non-deterministic; only
+        # apply it when the persisted profile is a recal-extended (>bare-ceiling) point.
+        [ -n "${MCLK_RECAL:-}" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
+    fi
+    if [ -n "$NDIV" ] && ! verify_hbm_profile "$NDIV" "$TIMINGS"; then
+        revert_boot_profile "HBM profile readback failed" "$TIMINGS"; return 1
     fi
     sleep 2
-    if wedged || [ "$(xids)" -gt 0 ]; then
-        logger -t 170tune "boot-apply: post-apply health check FAILED; reverting to stock"
-        "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; mclk_revert
-        disarm; exit 1
+    if wedged; then revert_boot_profile "runtime wedge detected" "$TIMINGS"; return 1; fi
+    if ctx_dead; then revert_boot_profile "CUDA context probe failed" "$TIMINGS"; return 1; fi
+    xids_after=$(xids || true); xids_after=${xids_after:-0}
+    if [ "$xids_after" -gt "$xids_before" ]; then
+        revert_boot_profile "new Xid detected" "$TIMINGS"; return 1
     fi
     disarm
-    logger -t 170tune "boot-apply: profile $s applied and healthy"
+    logger -t 170tune "boot-apply: profile $s applied and healthy (HBM=$hbm_state)"
 }
 
 # --------------------------------------------------------------- migration (HARDWARE-TEST-GATED)

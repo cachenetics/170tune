@@ -87,6 +87,11 @@ cat > "$TMP/bin/sync" <<'STUB'
 exit 0
 STUB
 
+cat > "$TMP/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+
 cat > "$TMP/bin/date" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -354,6 +359,15 @@ write_valid_hbm_receipt() {
     find "$TMP/state/gated-hbm/TESTSERIAL" -name '*.json' -type f | head -1
 }
 
+write_valid_sm_receipt() {
+    mkdir -p "$TMP/state/gated/TESTSERIAL"
+    cat > "$TMP/state/gated/TESTSERIAL/off100_clk1200.json" <<'EOF'
+{"serial": "TESTSERIAL", "offset": 100, "ceiling": 1200, "mclk_mhz": 1728,
+ "sweeps": 4, "peak_hbm_c": 65, "compute_check": true,
+ "workload": "test", "gated": "2026-08-05T12:00:00+08:00"}
+EOF
+}
+
 assert_receipt_rejected() {
     if run_tune receipt-test validate 70 "REFRESH 24" >/dev/null 2>&1; then
         fail "$1"
@@ -400,6 +414,30 @@ test_hbm_receipt_contents_are_authoritative() {
     rewrite_receipt "$receipt" 's/"workload_rc": 0/"workload_rc": 1/'
     assert_receipt_rejected "receipt with failed workload was accepted"
     printf 'PASS: HBM receipt contents are authoritative\n'
+}
+
+test_hbm_receipt_rejects_missing_required_fields() {
+    reset_controls
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"peak_hbm_c": 65,//'
+    assert_receipt_rejected "receipt with no peak temperature was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"sweeps": 4,//'
+    assert_receipt_rejected "receipt with no sweep count was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"workload": "true",//'
+    assert_receipt_rejected "receipt with no workload record was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"workload_timeout": 10,//'
+    assert_receipt_rejected "receipt with no workload timeout was accepted"
+
+    receipt=$(write_valid_hbm_receipt)
+    rewrite_receipt "$receipt" 's/"gated": "2026-08-05T12:00:00+08:00"/"gated": ""/'
+    assert_receipt_rejected "receipt with no qualification timestamp was accepted"
+    printf 'PASS: HBM receipt rejects missing required fields\n'
 }
 
 test_hbm_force_override_is_explicit() {
@@ -497,12 +535,285 @@ test_combined_hbm_gate_rejects_and_reverts_failures() {
     printf 'PASS: combined HBM gate rejects and reverts failures\n'
 }
 
+test_persist_rejects_nonstock_hbm_without_receipt() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    if run_tune persist save --ndiv 70 >/dev/null 2>&1; then
+        fail "non-stock HBM profile without a receipt was persisted"
+    fi
+    [ ! -f "$TMP/state/persist/TESTSERIAL.conf" ] ||
+        fail "rejected HBM profile still wrote a persist config"
+    printf 'PASS: persist rejects non-stock HBM without receipt\n'
+}
+
+test_persist_rejects_ambiguous_or_unrecoverable_timings() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    if run_tune persist save --timings "REFRESH 24" --force >/dev/null 2>&1; then
+        fail "timings without an exact NDIV were persisted"
+    fi
+    if run_tune persist save --ndiv 70 --timings "CL 24" --force >/dev/null 2>&1; then
+        fail "forced timing without a stock rollback value was persisted"
+    fi
+    printf 'PASS: persist rejects ambiguous or unrecoverable timings\n'
+}
+
+test_persist_records_qualified_hbm_profile() {
+    reset_controls
+    write_valid_hbm_receipt >/dev/null
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    run_tune persist save --ndiv 70 --timings "refresh 24" >/dev/null 2>&1 ||
+        fail "qualified HBM profile was rejected by persist save"
+    conf="$TMP/state/persist/TESTSERIAL.conf"
+    assert_file_contains "$conf" 'NDIV=70'
+    assert_file_contains "$conf" 'TIMINGS="REFRESH 24"'
+    assert_file_contains "$conf" 'HBM_FORCED=0'
+    printf 'PASS: persist records a qualified HBM profile\n'
+}
+
+test_persist_marks_forced_hbm_profile() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    output=$(run_tune persist save --ndiv 70 --timings "REFRESH 24" --force 2>&1) ||
+        fail "explicit forced HBM persistence was rejected: $output"
+    assert_contains "$output" "FORCED HBM persistence"
+    conf="$TMP/state/persist/TESTSERIAL.conf"
+    assert_file_contains "$conf" 'HBM_FORCED=1'
+    assert_file_contains "$conf" 'unqualified forced HBM override'
+
+    output=$(run_tune persist enable 2>&1) || fail "forced profile could not be enabled"
+    assert_contains "$output" "forced HBM override"
+    case "$output" in
+        *"qualified profile"*) fail "forced HBM profile was described as qualified" ;;
+    esac
+    printf 'PASS: persist marks forced HBM profiles explicitly\n'
+}
+
+test_persist_keeps_sm_only_and_stock_hbm_compatible() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm" "$TMP/state/gated"
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    write_valid_sm_receipt
+    run_tune persist save --offset 100 --clk 1200 >/dev/null 2>&1 ||
+        fail "SM-only qualified profile was rejected"
+    assert_file_contains "$TMP/state/persist/TESTSERIAL.conf" 'OFFSET=100'
+    assert_file_contains "$TMP/state/persist/TESTSERIAL.conf" 'HBM_FORCED=0'
+
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune persist save --ndiv 64 >/dev/null 2>&1 ||
+        fail "stock-HBM profile required an HBM receipt"
+    assert_file_contains "$TMP/state/persist/TESTSERIAL.conf" 'NDIV=64'
+    assert_file_contains "$TMP/state/persist/TESTSERIAL.conf" 'HBM_FORCED=0'
+    printf 'PASS: SM-only and stock-HBM persistence remain compatible\n'
+}
+
+test_persist_rejects_stale_hbm_receipt() {
+    reset_controls
+    write_valid_hbm_receipt >/dev/null
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    control_set driver 611.00
+    if run_tune persist save --ndiv 70 --timings "REFRESH 24" >/dev/null 2>&1; then
+        fail "persist save accepted an HBM receipt from another driver"
+    fi
+    [ ! -f "$TMP/state/persist/TESTSERIAL.conf" ] ||
+        fail "stale receipt still wrote a persist config"
+    printf 'PASS: persist rejects stale HBM receipts\n'
+}
+
+test_persist_enable_revalidates_hbm_receipt() {
+    reset_controls
+    write_valid_hbm_receipt >/dev/null
+    run_tune persist save --ndiv 70 --timings "REFRESH 24" >/dev/null 2>&1 ||
+        fail "test setup could not save qualified HBM profile"
+    rm -rf "$TMP/state/gated-hbm"
+    : > "$TMP/calls.log"
+    if run_tune persist enable >/dev/null 2>&1; then
+        fail "persist enable accepted a profile whose receipt was deleted"
+    fi
+    if grep -q '^systemctl enable ' "$TMP/calls.log"; then
+        fail "persist enable reached systemd after HBM validation failed"
+    fi
+    printf 'PASS: persist enable revalidates HBM receipts\n'
+}
+
+test_persist_unit_pins_boot_context_probe() {
+    reset_controls
+    write_valid_hbm_receipt >/dev/null
+    run_tune persist save --ndiv 70 --timings "REFRESH 24" >/dev/null 2>&1 ||
+        fail "test setup could not save qualified HBM profile"
+    rm -f "$TMP/persist.service"
+    run_tune persist enable >/dev/null 2>&1 || fail "persist enable failed"
+    assert_file_contains "$TMP/persist.service" "Environment=CTXPROBE=$TMP/bin/ctx_probe"
+    assert_file_contains "$TMP/persist.service" 'Environment=CTX_TIMEOUT=10'
+    printf 'PASS: persist unit pins the bounded boot context probe\n'
+}
+
+prepare_qualified_boot_profile() {
+    reset_controls
+    write_valid_hbm_receipt >/dev/null
+    run_tune persist save --ndiv 70 --timings "REFRESH 24" >/dev/null 2>&1 ||
+        fail "test setup could not save qualified boot profile"
+    control_set ndiv 64
+    control_set timing_REFRESH 6
+    : > "$TMP/calls.log"
+}
+
+test_boot_apply_is_bounded_and_checks_context() {
+    prepare_qualified_boot_profile
+    run_tune boot-apply >/dev/null 2>&1 ||
+        fail "boot-apply rejected a matching qualified profile"
+    assert_eq "$(cat "$TMP/control/ndiv")" 70
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 24
+    grep -q '^ctx_probe ' "$TMP/calls.log" ||
+        fail "boot-apply accepted the profile without a CUDA context probe"
+    if grep -qE '^(gpu_selftest|170hx-sweep|compute_check) ' "$TMP/calls.log"; then
+        fail "boot-apply invoked a qualification workload"
+    fi
+    [ ! -f "$TMP/state/armed.json" ] || fail "successful boot-apply left the armed marker"
+    printf 'PASS: boot apply is bounded and checks CUDA context\n'
+}
+
+test_boot_apply_rejects_missing_receipt_before_writes() {
+    prepare_qualified_boot_profile
+    rm -rf "$TMP/state/gated-hbm"
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "boot-apply accepted a non-stock HBM profile without its receipt"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    if grep -qE '^(hbm_mclk set 70|fbpa_regs set REFRESH 24)' "$TMP/calls.log"; then
+        fail "boot-apply wrote HBM registers before validating the receipt"
+    fi
+    printf 'PASS: boot apply rejects missing receipts before HBM writes\n'
+}
+
+test_boot_apply_rejects_timing_readback_mismatch() {
+    prepare_qualified_boot_profile
+    control_set timing_ignore_set 1
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "boot-apply accepted a timing write that did not take"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    grep -q '^hbm_mclk set 64' "$TMP/calls.log" ||
+        fail "timing readback failure did not invoke the stock NDIV fallback"
+    printf 'PASS: boot apply rejects timing readback mismatch\n'
+}
+
+assert_boot_failure_reverted_stock() {
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "$1 was accepted by boot-apply"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    [ ! -f "$TMP/state/armed.json" ] || fail "$1 left the armed marker"
+}
+
+test_boot_apply_rejects_ndiv_pll_context_and_runtime_faults() {
+    prepare_qualified_boot_profile
+    control_set hbm_ignore_set 1
+    assert_boot_failure_reverted_stock "NDIV readback mismatch"
+
+    prepare_qualified_boot_profile
+    control_set hbm_set_rc 3
+    assert_boot_failure_reverted_stock "PLL lock failure"
+
+    prepare_qualified_boot_profile
+    control_set ctx_rc 2
+    assert_boot_failure_reverted_stock "CUDA context failure"
+
+    prepare_qualified_boot_profile
+    printf '0\n1\n' > "$TMP/control/xid_sequence"
+    assert_boot_failure_reverted_stock "new Xid"
+
+    prepare_qualified_boot_profile
+    control_set sm_clock N/A
+    assert_boot_failure_reverted_stock "runtime wedge"
+    printf 'PASS: boot apply rejects NDIV, PLL, context, Xid, and wedge failures\n'
+}
+
+test_boot_apply_ignores_historical_xids() {
+    prepare_qualified_boot_profile
+    printf '2\n2\n' > "$TMP/control/xid_sequence"
+    run_tune boot-apply >/dev/null 2>&1 ||
+        fail "unchanged historical Xids caused boot-apply to reject the profile"
+    assert_eq "$(cat "$TMP/control/ndiv")" 70
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 24
+    printf 'PASS: boot apply ignores unchanged historical Xids\n'
+}
+
+test_boot_apply_rejects_stale_receipt_before_writes() {
+    prepare_qualified_boot_profile
+    control_set vbios 92.00.BAD
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "boot-apply accepted an HBM receipt from another VBIOS"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    if grep -qE '^(hbm_mclk set 70|fbpa_regs set REFRESH 24)' "$TMP/calls.log"; then
+        fail "boot-apply wrote HBM registers before stale receipt validation"
+    fi
+    printf 'PASS: boot apply rejects stale receipts before HBM writes\n'
+}
+
+test_boot_apply_logs_forced_profile() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune persist save --ndiv 70 --timings "REFRESH 24" --force >/dev/null 2>&1 ||
+        fail "test setup could not save forced HBM profile"
+    control_set ndiv 64
+    control_set timing_REFRESH 6
+    : > "$TMP/calls.log"
+    run_tune boot-apply >/dev/null 2>&1 || fail "forced HBM profile was rejected at boot"
+    grep -q 'logger .*HBM=forced' "$TMP/calls.log" ||
+        fail "boot log did not identify the HBM profile as forced"
+    printf 'PASS: boot apply labels forced HBM profiles\n'
+}
+
+test_boot_apply_keeps_old_sm_only_profile_compatible() {
+    reset_controls
+    cat > "$TMP/state/persist/TESTSERIAL.conf" <<'EOF'
+# legacy SM-only profile without HBM_FORCED
+NDIV=
+OFFSET=100
+CLK=1200
+TIMINGS=""
+EOF
+    : > "$TMP/calls.log"
+    run_tune boot-apply >/dev/null 2>&1 ||
+        fail "legacy SM-only profile was rejected at boot"
+    grep -q '^nvml_oc 100 0' "$TMP/calls.log" || fail "SM offset was not applied"
+    if grep -qE '^(hbm_mclk set|fbpa_regs set)' "$TMP/calls.log"; then
+        fail "SM-only boot unexpectedly wrote HBM state"
+    fi
+    printf 'PASS: boot apply keeps legacy SM-only profiles compatible\n'
+}
+
 test_path_overrides_isolate_state
 test_hbm_profile_identity_is_canonical
 test_hbm_profile_rejects_malformed_timings
 test_missing_hbm_receipt_is_rejected
 test_exact_hbm_receipt_is_written_and_accepted
 test_hbm_receipt_contents_are_authoritative
+test_hbm_receipt_rejects_missing_required_fields
 test_hbm_force_override_is_explicit
 test_combined_hbm_gate_writes_exact_receipt
 test_combined_hbm_gate_rejects_and_reverts_failures
+test_persist_rejects_nonstock_hbm_without_receipt
+test_persist_rejects_ambiguous_or_unrecoverable_timings
+test_persist_records_qualified_hbm_profile
+test_persist_marks_forced_hbm_profile
+test_persist_keeps_sm_only_and_stock_hbm_compatible
+test_persist_rejects_stale_hbm_receipt
+test_persist_enable_revalidates_hbm_receipt
+test_persist_unit_pins_boot_context_probe
+test_boot_apply_is_bounded_and_checks_context
+test_boot_apply_rejects_missing_receipt_before_writes
+test_boot_apply_rejects_timing_readback_mismatch
+test_boot_apply_rejects_ndiv_pll_context_and_runtime_faults
+test_boot_apply_ignores_historical_xids
+test_boot_apply_rejects_stale_receipt_before_writes
+test_boot_apply_logs_forced_profile
+test_boot_apply_keeps_old_sm_only_profile_compatible
