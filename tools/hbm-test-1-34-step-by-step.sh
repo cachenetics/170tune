@@ -380,7 +380,14 @@ done
 
 if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 ..."
-    mkdir -p "$RUN_DIR"
+    # Create the run dir with mktemp -d: a root-owned, mode-700, unpredictable
+    # name. The parent (RUN_ROOT, default /var/tmp) is world-writable, so a
+    # guessable name lets a local user pre-create/relink entries between the
+    # write and the root exec of guarded-workload.sh. mktemp closes that race.
+    RUN_DIR=$(mktemp -d "$RUN_ROOT/170tune-hbm-test-$STAMP-XXXXXX") \
+        || die "failed to create run directory under $RUN_ROOT"
+    LOG="$RUN_DIR/run.log"
+    TELEMETRY="$RUN_DIR/telemetry.csv"
     : >"$LOG"
     trap cleanup EXIT INT TERM
 fi
