@@ -7,8 +7,9 @@ stock**, so a bad profile is masked over ssh, never a brick.
 
 > **The one rule: "it did not crash" is not a result.** On this card the failure that matters is
 > silent - an overclock can pass every benchmark, throw no Xid, never hang, and still return wrong
-> bytes (intermittently, worse when hot). Only `gate` - a hot, full-VRAM write/read-back sweep plus
-> a bit-exact compute check - can call a point safe. See [Safety](#safety) for why, and for the
+> bytes (intermittently, worse when hot). Only `gate` for SM or the exact-profile `hbm-gate` for
+> HBM - hot, full-VRAM write/read-back sweeps plus a bit-exact compute check - can qualify a point.
+> See [Safety](#safety) for why, and for the
 > quarantine / wedge-detection layers behind it.
 
 ## Contents
@@ -34,9 +35,13 @@ sudo ./install.sh            # build the helper tools from source, install to /u
 sudo 170tune preflight       # check the card, driver, stock mclk, iomem access, the unlock
 sudo 170tune snapshot-stock  # record THIS card's stock values as its revert baseline (once)
 
-sudo 170tune mclk-gate 70 12                        # prove NDIV 70 on THIS card: 12 hot sweeps + compute
-sudo 170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable profile
-sudo 170tune persist enable                         # re-apply it after every boot (the card still boots stock)
+sudo WORKLOAD_TIMEOUT=28800 170tune hbm-gate \
+  --ndiv 70 \
+  --timings "REFRESH 24" \
+  --sweeps 12 \
+  --workload "/path/to/the/real/serving-soak.sh"
+sudo 170tune persist save --ndiv 70 --timings "REFRESH 24"
+sudo 170tune persist enable                         # bounded validation at boot; no hot/full-VRAM retest
 ```
 
 **Why NDIV 70, not higher?** The pattern-sweep gate (`mclk-gate`) passes up to NDIV 76, but that is a
@@ -120,6 +125,8 @@ record it so persist refuses it thereafter:
 170tune mclk-status                          current NDIV / MHz / PLL lock / PLM state
 170tune mclk-try   <NDIV>                    set the memory clock live (NDIV x 27 MHz), prove it moved
 170tune mclk-gate  <NDIV> [n]                prove it: core pinned, n hot sweeps + compute
+170tune hbm-gate --ndiv N [--timings "FIELD VALUE ..."] [--sweeps N] [--workload "COMMAND"]
+                                             qualify the exact combined profile for persistence
 170tune mclk-ladder [start step max]         walk NDIV up, gating each rung hot, stop at the cliff
 170tune hbm-matrix [start step max]          bandwidth/latency per NDIV (fast, UNVERIFIED measurement)
 170tune timings [dump|get|set|save|load] ... drive the DRAM CONFIG timings directly
@@ -150,7 +157,10 @@ right clock depends on whether you are SERVING or benchmarking:
 **The pattern-sweep gate (`mclk-gate`) is necessary but NOT sufficient for serving** - it is
 memory-only and cool. NDIV 76 gates 12/12 yet wedges on the first real inference load. Always add a
 real-workload rung (see the [`hbm-matrix.md`](docs/hbm-matrix.md) serving caveat and the tuning
-guide's "Memory OC under a REAL serving workload"). Prove the point on the card, then persist (below).
+guide's "Memory OC under a REAL serving workload"). `hbm-gate` combines the exact NDIV/timing
+profile, hot full-VRAM sweeps, compute/context checks, and that workload rung into the receipt that
+HBM persistence requires. The exploratory `mclk-gate`, `timings-gate`, and `refresh gate` commands
+do not create this combined receipt.
 
 ## Persist across reboots
 
@@ -163,11 +173,28 @@ mid-apply), it stays stock rather than re-applying a possibly-bad point.
 170tune gate 200 1400 4 --workload /usr/local/bin/vllm_workload_check.sh
 170tune persist save --offset 200 --clk 1400   # refuses without a passing receipt (-f overrides)
 170tune persist save --profile eff             # or: a named profile, resolved at save time
-170tune mclk-gate 70 12                         # prove the HBM point on THIS card, hot (then gate under a real workload)
-170tune persist save --ndiv 70 --timings "REFRESH 24"   # the serving-stable HBM point; combine with the SM save above, or alone
+WORKLOAD_TIMEOUT=28800 170tune hbm-gate \
+  --ndiv 70 --timings "REFRESH 24" --sweeps 12 \
+  --workload "/path/to/the/real/serving-soak.sh"
+170tune persist save --ndiv 70 --timings "REFRESH 24"
 170tune persist enable                          # install + enable the boot service
 170tune persist status                          # show the profile and service state
 ```
+
+The HBM receipt is tied to the exact NDIV/timing pair, card serial, PCI device ID, driver, and
+VBIOS. `persist save` requires it, and `persist enable` checks it again so a deleted, stale, or
+manually edited profile cannot bypass qualification. A driver or VBIOS change invalidates the
+receipt. Existing non-stock HBM profiles remain on disk after upgrade but will not be enabled or
+applied until the exact profile is requalified with `hbm-gate` and saved again.
+
+`--force` is an explicit compatibility escape hatch. It stores `HBM_FORCED=1` and labels the
+profile as an unqualified forced override in the config and boot logs; it does not turn missing
+evidence into a qualification.
+
+The expensive test runs once for each exact profile/environment. At boot, `boot-apply` validates
+the receipt, applies timing fields and NDIV with register readback, probes a bounded CUDA context,
+and rejects only Xids added during that apply. Any failure restores the configured stock NDIV and
+timings. Boot never calls the full-VRAM sweep, compute gate, hot soak, or external workload.
 
 Recover a misbehaving profile remotely with `systemctl mask 170tune-persist.service` (boot stays
 stock) or `170tune persist disable`. A box still on the earlier per-profile `170hx-oc.service` model
@@ -271,11 +298,11 @@ GATE_TEMP=60          HBM temperature to soak to before every sweep
 GATE_SOAK_MAX=180     give up soaking after this many seconds
 GATE_COMPUTE=45       seconds of bit-exact GEMM checking per gate (0 disables)
 MEASURE_TIMEOUT=180   a measurement exceeding this is treated as a HANG
-WORKLOAD_TIMEOUT=900  'gate --workload': a workload that hangs counts as a FAILURE
+WORKLOAD_TIMEOUT=900  'gate/hbm-gate --workload': a workload that hangs counts as a FAILURE
 CTX_TIMEOUT=60        context probe timeout; a probe that hangs is treated as a wedge
 CTXPROBE=/path        the context probe (default: the ctx_probe installed here)
 BENCH=/path           the SM integrity sweep (default: the 170hx-sweep installed here)
-SWEEP_FRAC=0.95       fraction of FREE VRAM 170hx-sweep writes and verifies
+SWEEP_FRAC=0.95       resident two-phase sweep coverage of FREE VRAM (hbm-gate requires >=0.95)
 COMPUTE=/path         the compute checker        NVML=/path        nvml_oc
 MCLK_GATE_SOAK_MAX=360  soak budget for mclk-gate/mclk-ladder (mclk rungs cool faster)
 MCLK_TUNE=1            apply the per-NDIV timing tune during mclk-gate/ladder (extends 76->77)

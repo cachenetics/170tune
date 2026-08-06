@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
+#include "resident_sweep.h"
+
 #define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
   printf("CUDA_ERROR=%s@%d:%s\n", #x, __LINE__, cudaGetErrorString(e)); \
   printf("RESULT=FAIL\n"); return 3; } } while(0)
@@ -57,6 +59,11 @@ __global__ void compute(uint64_t* out, size_t n, uint64_t k){
 
 int main(int argc, char** argv){
   double frac = (argc>1)? atof(argv[1]) : 0.92;   // fraction of FREE vram to sweep
+  if (!(frac > 0.0 && frac <= 1.0)) {
+    printf("INVALID_SWEEP_FRACTION=%.17g\n", frac);
+    printf("RESULT=FAIL\n");
+    return 2;
+  }
   int dev=0; CK(cudaSetDevice(dev));
   cudaDeviceProp pr; CK(cudaGetDeviceProperties(&pr, dev));
   size_t freeB=0, totB=0; CK(cudaMemGetInfo(&freeB,&totB));
@@ -111,30 +118,60 @@ int main(int argc, char** argv){
     cudaFree(ta); cudaFree(tb); cudaFree(tc);             // free BEFORE the sweep sizes itself
   }
 
-  // ---- full-VRAM memory integrity sweep ----
+  // ---- resident full-VRAM memory integrity sweep ----
+  // Keep every chunk allocated at the same time, fill ALL chunks, then verify ALL chunks.
+  // Fill+verify+free one chunk at a time cannot detect a fake 64 GB mapping backed by a smaller
+  // physical HBM window: a later allocation may reuse/alias the same backing only after the
+  // earlier pattern has already been checked and discarded.
   unsigned long long *dErr=nullptr, hErr=0; CK(cudaMalloc(&dErr,sizeof(hErr))); CK(cudaMemset(dErr,0,sizeof(hErr)));
   const uint64_t SEED=0xA5A5F00D12345678ULL;
   CK(cudaMemGetInfo(&freeB,&totB));
+  const size_t minChunkBytes = (size_t)64<<20;
+  const size_t chunkBytes = (size_t)1<<30;         // 1 GiB preferred chunks
   size_t target = (size_t)(freeB*frac);
-  size_t chunkBytes = (size_t)1<<30;              // 1 GiB chunks
-  uint64_t globalBase=0; size_t sweptB=0; int chunks=0;
-  uint64_t* cd=nullptr;
-  while(sweptB < target){
-    size_t want = chunkBytes; if(target-sweptB < want) want = target-sweptB;
-    // shrink until the alloc succeeds (leaves headroom for driver)
-    while(want >= ((size_t)64<<20) && cudaMalloc(&cd, want)!=cudaSuccess){ want >>= 1; }
-    if(want < ((size_t)64<<20)) break;
-    size_t n = want/sizeof(uint64_t);
-    size_t blocks = (n+TPB-1)/TPB;
-    fill<<<blocks,TPB>>>(cd,n,globalBase,SEED);
-    verify<<<blocks,TPB>>>(cd,n,globalBase,SEED,dErr);
-    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-    cudaFree(cd); cd=nullptr;
-    globalBase += n; sweptB += want; chunks++;
-  }
+  target -= target % minChunkBytes;
+
+  const ResidentSweepResult sweep = run_resident_sweep(
+      target, chunkBytes, minChunkBytes,
+      [](size_t bytes, void** handle) {
+        cudaError_t e = cudaMalloc(handle, bytes);
+        if (e == cudaSuccess) return true;
+        cudaGetLastError();                         // clear the failed allocation before retry
+        *handle = nullptr;
+        return false;
+      },
+      [&](void* handle, size_t bytes, uint64_t base) {
+        size_t n = bytes/sizeof(uint64_t);
+        size_t blocks = (n+TPB-1)/TPB;
+        fill<<<blocks,TPB>>>(static_cast<uint64_t*>(handle),n,base,SEED);
+        cudaError_t e = cudaGetLastError();
+        if (e == cudaSuccess) e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+          printf("CUDA_ERROR=resident_fill:%s\n", cudaGetErrorString(e));
+          return false;
+        }
+        return true;
+      },
+      [&](void* handle, size_t bytes, uint64_t base) {
+        size_t n = bytes/sizeof(uint64_t);
+        size_t blocks = (n+TPB-1)/TPB;
+        verify<<<blocks,TPB>>>(static_cast<const uint64_t*>(handle),n,base,SEED,dErr);
+        cudaError_t e = cudaGetLastError();
+        if (e == cudaSuccess) e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+          printf("CUDA_ERROR=resident_verify:%s\n", cudaGetErrorString(e));
+          return false;
+        }
+        return true;
+      },
+      [](void* handle) { if (handle) cudaFree(handle); });
+
   CK(cudaMemcpy(&hErr,dErr,sizeof(hErr),cudaMemcpyDeviceToHost)); cudaFree(dErr);
-  printf("MEM_SWEPT_MIB=%zu\n", sweptB>>20);
-  printf("MEM_CHUNKS=%d\n", chunks);
+  printf("MEM_TARGET_MIB=%zu\n", target>>20);
+  printf("MEM_SWEPT_MIB=%zu\n", sweep.swept_bytes>>20);
+  printf("MEM_CHUNKS=%zu\n", sweep.chunks);
+  printf("MEM_SWEEP_MODE=resident-two-phase-v1\n");
+  printf("MEM_COMPLETE=%d\n", sweep.complete?1:0);
   printf("MEM_ERRORS=%llu\n", hErr);
 
   // ---- compute sanity (exact integer checksum) ----
@@ -153,7 +190,8 @@ int main(int argc, char** argv){
   int compute_ok = (sum==csum);
   printf("COMPUTE_OK=%d\n", compute_ok);
 
-  int pass = (hErr==0) && compute_ok && (sweptB>0);
+  int pass = (hErr==0) && compute_ok && sweep.complete && sweep.fill_ok &&
+             sweep.verify_ok && (sweep.swept_bytes>0);
   printf("RESULT=%s\n", pass?"PASS":"FAIL");
   return pass?0:1;
 }

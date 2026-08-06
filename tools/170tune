@@ -33,7 +33,7 @@ set -uo pipefail
 # real tools resolve from /usr/local/bin first anyway).
 : "${HOME:=/root}"
 
-STATE=/var/lib/170tune
+STATE=${STATE:-/var/lib/170tune}
 # Paths must survive sudo, where $HOME becomes /root. Resolve against the INVOKING user's home.
 user_home() { getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6; }
 find_tool() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
@@ -89,8 +89,8 @@ STOCK_TIMINGS=${STOCK_TIMINGS:-"RC:67 RFC:657 RAS:43 RP:24 RD_RCD:27 WR_RCD:18 W
 # to hold stock ns, + bus-turnaround 8->12 + CDLR 9->13). This is what extends the robust ceiling past
 # the bare limit (measured 76 bare -> 77 tuned), deterministically, with no DDLL recal.
 MCLK_TUNE=${MCLK_TUNE:-}
-PERSIST=/var/lib/170tune/persist
-PERSIST_UNIT=/etc/systemd/system/170tune-persist.service
+PERSIST=${PERSIST:-$STATE/persist}
+PERSIST_UNIT=${PERSIST_UNIT:-/etc/systemd/system/170tune-persist.service}
 # Both shipped 170HX SKUs: 8GB (0x20C2, 64GB unlock) and 10GB (0x2082, 40GB unlock). A 16GB ROM
 # exists but was never shipped, so it is deliberately not matched here.
 DEVID_170HX_PATTERNS="20c2 2082"
@@ -105,6 +105,207 @@ need_root() { [ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"; }
 serial() { nvidia-smi --query-gpu=serial --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
 devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
 xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
+
+# Canonical HBM profile identity. Persistence receipts must describe the exact
+# combined NDIV/timing state, independent of argument order or field case.
+normalize_timings() {
+    local raw=${1:-} field value records="" seen=""
+    [ -n "$raw" ] || { printf '\n'; return 0; }
+    # Intentional word splitting: the CLI format is FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $raw
+    [ $(( $# % 2 )) -eq 0 ] || { printf 'timings must be FIELD VALUE pairs\n' >&2; return 1; }
+    while [ $# -gt 0 ]; do
+        field=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+        value=$2
+        shift 2
+        [[ "$field" =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'invalid timing field: %s\n' "$field" >&2; return 1; }
+        [[ "$value" =~ ^[0-9]+$ ]] || { printf 'invalid timing value for %s: %s\n' "$field" "$value" >&2; return 1; }
+        case " $seen " in
+            *" $field "*) printf 'duplicate timing field: %s\n' "$field" >&2; return 1 ;;
+        esac
+        seen="$seen $field"
+        records="${records}${field} ${value}\n"
+    done
+    printf '%b' "$records" | LC_ALL=C sort -k1,1 | awk '
+        BEGIN { sep = "" }
+        { printf "%s%s %s", sep, $1, $2; sep = " " }
+        END { print "" }
+    '
+}
+
+hbm_profile_id() {
+    local ndiv=${1:-} timings=${2:-} normalized digest
+    [[ "$ndiv" =~ ^[0-9]+$ ]] || { printf 'invalid NDIV: %s\n' "$ndiv" >&2; return 1; }
+    normalized=$(normalize_timings "$timings") || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf 'ndiv=%s;timings=%s' "$ndiv" "$normalized" | sha256sum | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf 'ndiv=%s;timings=%s' "$ndiv" "$normalized" | shasum -a 256 | awk '{print $1}')
+    else
+        printf 'sha256sum or shasum is required\n' >&2
+        return 1
+    fi
+    printf '%.16s\n' "$digest"
+}
+
+driver_version() { nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+vbios_version()  { nvidia-smi --query-gpu=vbios_version  --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+
+hbm_receipt_file() {
+    local ndiv=${1:?ndiv} timings=${2:-} profile_id
+    profile_id=$(hbm_profile_id "$ndiv" "$timings") || return 1
+    printf '%s/gated-hbm/%s/%s.json' "$STATE" "$(serial)" "$profile_id"
+}
+
+json_escape() {
+    local value=${1:-}
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    printf '%s' "$value"
+}
+
+iso_timestamp() {
+    date -Is 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+fraction_to_milli() {
+    local value=${1:-}
+    [[ "$value" =~ ^(0|0?[.][0-9]+|1([.]0+)?)$ ]] || return 1
+    awk -v value="$value" 'BEGIN {
+        if (value <= 0 || value > 1) exit 1
+        printf "%d\n", value * 1000
+    }'
+}
+
+write_hbm_receipt() {
+    local ndiv=${1:?ndiv} timings=${2:-} sweeps=${3:?sweeps} peak=${4:?peak_hbm_c}
+    local workload=${5:-} workload_rc=${6:-0}
+    local sweep_mode=${7:-resident-two-phase-v1} sweep_fraction_milli=${8:-950}
+    local normalized receipt workload_json
+    normalized=$(normalize_timings "$timings") || return 1
+    receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
+    mkdir -p "$(dirname "$receipt")"
+    if [ -n "$workload" ]; then
+        workload_json="\"$(json_escape "$workload")\""
+    else
+        workload_json=null
+    fi
+    cat > "$receipt" <<EOF
+{"serial": "$(json_escape "$(serial)")", "device_id": "$(json_escape "$(devid)")",
+ "driver_version": "$(json_escape "$(driver_version)")", "vbios_version": "$(json_escape "$(vbios_version)")",
+ "ndiv": $ndiv, "timings": "$(json_escape "$normalized")", "sweeps": $sweeps, "peak_hbm_c": $peak,
+ "sweep_mode": "$(json_escape "$sweep_mode")", "sweep_fraction_milli": $sweep_fraction_milli,
+ "compute_check": true, "context_check": true, "workload": $workload_json,
+ "workload_timeout": ${WORKLOAD_TIMEOUT:-0}, "workload_rc": $workload_rc, "gated": "$(iso_timestamp)"}
+EOF
+    sync
+    printf '%s\n' "$receipt"
+}
+
+receipt_string_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *\"[^\"]*\"" "$file" 2>/dev/null | head -1 |
+        sed -E 's/^[^:]+: *"([^"]*)"$/\1/'
+}
+
+receipt_number_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *-?[0-9]+" "$file" 2>/dev/null | head -1 |
+        grep -oE -- '-?[0-9]+$'
+}
+
+receipt_bool_field() {
+    local file=$1 field=$2
+    grep -oE "\"${field}\": *(true|false)" "$file" 2>/dev/null | head -1 |
+        awk '{print $NF}'
+}
+
+hbm_receipt_structure_ok() {
+    local file=$1 compact key count
+    [ -f "$file" ] || return 1
+    compact=$(LC_ALL=C tr -d '[:space:]' < "$file")
+    case "$compact" in \{*\}) ;; *) return 1 ;; esac
+    for key in serial device_id driver_version vbios_version ndiv timings sweeps peak_hbm_c \
+               sweep_mode sweep_fraction_milli \
+               compute_check context_check workload workload_timeout workload_rc gated; do
+        count=$(grep -oE "\"${key}\"[[:space:]]*:" "$file" 2>/dev/null | wc -l | tr -d ' ')
+        [ "$count" = 1 ] || return 1
+    done
+}
+
+HBM_RECEIPT_FORCED=0
+hbm_receipt_gate() {
+    local ndiv=${1:?ndiv} timings=${2:-} force=${3:-0} receipt normalized reason=""
+    local rec_peak rec_sweeps rec_mode rec_fraction rec_timeout rec_workload_rc rec_gated
+    HBM_RECEIPT_FORCED=0
+    normalized=$(normalize_timings "$timings") || return 1
+    receipt=$(hbm_receipt_file "$ndiv" "$normalized") || return 1
+    rec_peak=$(receipt_number_field "$receipt" peak_hbm_c)
+    rec_sweeps=$(receipt_number_field "$receipt" sweeps)
+    rec_mode=$(receipt_string_field "$receipt" sweep_mode)
+    rec_fraction=$(receipt_number_field "$receipt" sweep_fraction_milli)
+    rec_timeout=$(receipt_number_field "$receipt" workload_timeout)
+    rec_workload_rc=$(receipt_number_field "$receipt" workload_rc)
+    rec_gated=$(receipt_string_field "$receipt" gated)
+    if [ ! -f "$receipt" ]; then
+        reason="no exact HBM gate receipt for NDIV $ndiv timings '$normalized' on card $(serial)"
+    elif ! hbm_receipt_structure_ok "$receipt"; then
+        reason="HBM gate receipt is malformed or has duplicate/missing fields"
+    elif [ "$(receipt_string_field "$receipt" serial)" != "$(serial)" ]; then
+        reason="HBM gate receipt serial does not match the installed card"
+    elif [ "$(receipt_string_field "$receipt" device_id)" != "$(devid)" ]; then
+        reason="HBM gate receipt device ID does not match the installed card"
+    elif [ "$(receipt_string_field "$receipt" driver_version)" != "$(driver_version)" ]; then
+        reason="HBM gate receipt driver version does not match the running driver"
+    elif [ "$(receipt_string_field "$receipt" vbios_version)" != "$(vbios_version)" ]; then
+        reason="HBM gate receipt VBIOS version does not match the installed card"
+    elif [ "$(receipt_number_field "$receipt" ndiv)" != "$ndiv" ]; then
+        reason="HBM gate receipt NDIV does not match the requested profile"
+    elif [ "$(receipt_string_field "$receipt" timings)" != "$normalized" ]; then
+        reason="HBM gate receipt timings do not match the requested profile"
+    elif ! [[ "$rec_peak" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid peak temperature"
+    elif [ "${GATE_TEMP:-60}" -gt "$rec_peak" ]; then
+        reason="HBM gate receipt is cold (peak below ${GATE_TEMP:-60}C)"
+    elif ! [[ "$rec_sweeps" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid sweep count"
+    elif [ "$rec_sweeps" -lt 4 ]; then
+        reason="HBM gate receipt has fewer than four hot sweeps"
+    elif [ "$rec_mode" != resident-two-phase-v1 ]; then
+        reason="HBM gate receipt was not produced by the resident two-phase sweep"
+    elif ! [[ "$rec_fraction" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid sweep coverage"
+    elif [ "$rec_fraction" -lt 950 ]; then
+        reason="HBM gate receipt covered less than 95 percent of free VRAM"
+    elif [ "$rec_fraction" -gt 1000 ]; then
+        reason="HBM gate receipt claims more than 100 percent sweep coverage"
+    elif [ "$(receipt_bool_field "$receipt" compute_check)" != true ]; then
+        reason="HBM gate receipt has no passing compute check"
+    elif [ "$(receipt_bool_field "$receipt" context_check)" != true ]; then
+        reason="HBM gate receipt has no passing CUDA context check"
+    elif ! grep -qE '"workload": *(null|")' "$receipt" 2>/dev/null; then
+        reason="HBM gate receipt has no valid workload record"
+    elif ! [[ "$rec_timeout" =~ ^[0-9]+$ ]]; then
+        reason="HBM gate receipt has no valid workload timeout"
+    elif [ "$rec_workload_rc" != 0 ]; then
+        reason="HBM gate receipt records a failed workload"
+    elif ! [[ "$rec_gated" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$ ]]; then
+        reason="HBM gate receipt has no valid qualification timestamp"
+    fi
+    if [ -n "$reason" ]; then
+        say "${c_bad}${reason}${c_off}"
+        [ "$force" = 1 ] || return 1
+        HBM_RECEIPT_FORCED=1
+        say "${c_warn}FORCED HBM persistence: proceeding without qualification evidence${c_off}"
+        return 0
+    fi
+    say "${c_ok}exact HBM gate receipt accepted: $receipt${c_off}"
+    return 0
+}
 
 is_170hx() {
     local d p; d="$(devid)"
@@ -987,7 +1188,15 @@ mclk_verify() {
 _hot_gate_sweeps() {
     local n=${1:-4} label=${2:-oc} soakmax=${3:-$GATE_SOAK_MAX} recal=${4:-}
     [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST (set SELFTEST=...)"
-    local fails=0 i res errs tmax=0 t
+    local fails=0 i res errs tmax=0 t sweep_fraction sweep_fraction_milli
+    sweep_fraction=${SWEEP_FRAC:-0.95}
+    sweep_fraction_milli=$(fraction_to_milli "$sweep_fraction") || die "invalid SWEEP_FRAC '$sweep_fraction'"
+    LAST_GATE_SWEEPS=$n
+    LAST_GATE_PEAK_HBM=0
+    LAST_GATE_COMPUTE_OK=0
+    LAST_GATE_CONTEXT_OK=0
+    LAST_GATE_SWEEP_MODE=resident-two-phase-v1
+    LAST_GATE_SWEEP_FRAC_MILLI=$sweep_fraction_milli
     # Soak to operating temp ONCE, then recal the eye ONCE in that state. Do NOT re-soak (oc_eff)
     # between sweeps: a heavy core soak between sweeps swings the core clock and drifts the eye - a
     # GATE ARTIFACT that faults even a rock-solid NDIV. Steady back-to-back memory sweeps hold temp
@@ -996,10 +1205,11 @@ _hot_gate_sweeps() {
     t=$(GATE_SOAK_MAX=$soakmax soak_to_temp); tmax=${t:-0}
     [ -n "$recal" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
     disarm
-    local out cok swept
+    local out cok swept complete mode result sweep_rc
     for i in $(seq 1 "$n"); do
         arm "$label" 0
-        out=$(timeout "$SWEEP_TIMEOUT" "$SELFTEST" "${SWEEP_FRAC:-0.15}" 2>&1)
+        out=$(timeout "$SWEEP_TIMEOUT" "$SELFTEST" "$sweep_fraction" 2>&1)
+        sweep_rc=$?
         disarm
         t=$(gpu_temp); [ "${t:-0}" -gt "$tmax" ] 2>/dev/null && tmax=$t
         # rare: if the card cooled below the gate floor, re-soak AND re-recal (a soak swings the core)
@@ -1009,9 +1219,20 @@ _hot_gate_sweeps() {
         errs=$(printf '%s' "$out" | grep -oE 'MEM_ERRORS=[0-9]+' | head -1 | cut -d= -f2)
         cok=$(printf '%s' "$out" | grep -oE 'COMPUTE_OK=[0-9]+' | head -1 | cut -d= -f2)
         swept=$(printf '%s' "$out" | grep -oE 'MEM_SWEPT_MIB=[0-9]+' | head -1 | cut -d= -f2)
+        complete=$(printf '%s' "$out" | grep -oE 'MEM_COMPLETE=[0-9]+' | head -1 | cut -d= -f2)
+        mode=$(printf '%s' "$out" | grep -oE 'MEM_SWEEP_MODE=[A-Za-z0-9._-]+' | head -1 | cut -d= -f2)
+        result=$(printf '%s' "$out" | grep -oE 'RESULT=(PASS|FAIL)' | head -1 | cut -d= -f2)
         # A missing MEM_ERRORS means the sweep did not run (tool path, permissions) - FAIL, never pass.
-        if [ -z "$errs" ]; then say "  sweep $i: ${c_bad}did not run (no MEM_ERRORS from $SELFTEST)${c_off}"; fails=$((fails + 1)); continue; fi
-        if [ "$errs" -ne 0 ] || [ "${cok:-0}" -ne 1 ]; then
+        if [ "$sweep_rc" -ne 0 ] || [ "$result" != PASS ]; then
+            say "  sweep $i: ${c_bad}selftest failed rc=$sweep_rc result=${result:-missing}${c_off}  (${swept:-?}MiB, HBM ${t}C)"
+            fails=$((fails + 1))
+        elif [ -z "$errs" ]; then
+            say "  sweep $i: ${c_bad}did not run (no MEM_ERRORS from $SELFTEST)${c_off}"
+            fails=$((fails + 1))
+        elif [ "$mode" != resident-two-phase-v1 ] || [ "${complete:-0}" -ne 1 ]; then
+            say "  sweep $i: ${c_bad}invalid coverage mode=${mode:-missing} complete=${complete:-missing}${c_off}  (${swept:-?}MiB, HBM ${t}C)"
+            fails=$((fails + 1))
+        elif [ "$errs" -ne 0 ] || [ "${cok:-0}" -ne 1 ]; then
             say "  sweep $i: ${c_bad}mem_errors=$errs compute_ok=${cok:-?}  <- CORRUPTION${c_off}  (${swept:-?}MiB, HBM ${t}C)"; fails=$((fails + 1))
         else
             say "  sweep $i: ${c_ok}mem_errors=0 compute_ok=1${c_off}  (${swept:-?}MiB, HBM ${t}C)"
@@ -1022,7 +1243,13 @@ _hot_gate_sweeps() {
         arm "$label" 0
         local crc; timeout $((GATE_COMPUTE + 120)) "$COMPUTE" "$GATE_COMPUTE" >/dev/null 2>&1; crc=$?
         disarm
-        [ $crc -eq 0 ] && say "  compute: ${c_ok}clean${c_off}" || { say "  compute: ${c_bad}FAILED${c_off}"; fails=$((fails + 1)); }
+        if [ $crc -eq 0 ]; then
+            LAST_GATE_COMPUTE_OK=1
+            say "  compute: ${c_ok}clean${c_off}"
+        else
+            say "  compute: ${c_bad}FAILED${c_off}"
+            fails=$((fails + 1))
+        fi
     else
         say "  ${c_warn}compute check skipped (compute_check not found) - memory-only gate${c_off}"
     fi
@@ -1033,13 +1260,149 @@ _hot_gate_sweeps() {
         say "  ${c_bad}context check: FAILED - the card answers nvidia-smi but no CUDA context can be created${c_off}"
         say "  ${c_bad}  this is the wedge query-based checks miss. Do not trust the sweep results above - recover first.${c_off}"
         fails=$((fails + 1))
+    else
+        LAST_GATE_CONTEXT_OK=1
     fi
+    LAST_GATE_PEAK_HBM=${tmax:-0}
     if [ "${tmax:-0}" -lt "$GATE_TEMP" ] 2>/dev/null; then
         say "${c_bad}REJECTED: HBM never reached ${GATE_TEMP}C (peaked ${tmax}C) - a cold gate cannot bless $label${c_off}"
         return 1
     fi
     [ "$fails" -eq 0 ] && { say "${c_ok}GATED: $label passed $n/$n sweeps + compute (peak HBM ${tmax}C)${c_off}"; return 0; }
     say "${c_bad}REJECTED: $fails/$n failed ($label)${c_off}"; return 1
+}
+
+apply_hbm_timings() {
+    local normalized field value readback
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # Intentional splitting of canonical FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        "$FBPA_REGS" set "$field" "$value" >/dev/null 2>&1 || return 1
+        readback=$("$FBPA_REGS" get "$field" 2>/dev/null) || return 1
+        [ "$readback" = "$value" ] || return 1
+    done
+}
+
+verify_hbm_profile() {
+    local ndiv=$1 normalized field value readback
+    normalized=$(normalize_timings "${2:-}") || return 1
+    [ "$(cur_ndiv)" = "$ndiv" ] || return 1
+    [ -n "$normalized" ] || return 0
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        readback=$("$FBPA_REGS" get "$field" 2>/dev/null) || return 1
+        [ "$readback" = "$value" ] || return 1
+    done
+}
+
+stock_timing_value() {
+    local wanted=$1 kv
+    if [ "$wanted" = REFRESH ]; then
+        printf '%s\n' "$STOCK_REFRESH"
+        return 0
+    fi
+    for kv in $STOCK_TIMINGS; do
+        if [ "${kv%:*}" = "$wanted" ]; then
+            printf '%s\n' "${kv#*:}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_rollbackable_timings() {
+    local normalized field value
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # Intentional splitting of canonical FIELD VALUE pairs.
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        if ! stock_timing_value "$field" >/dev/null; then
+            say "${c_bad}refusing timing $field: no stock rollback value is configured${c_off}"
+            return 1
+        fi
+    done
+}
+
+restore_hbm_timings() {
+    local normalized field value stock
+    normalized=$(normalize_timings "${1:-}") || return 1
+    [ -n "$normalized" ] || return 0
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        field=$1; value=$2; shift 2
+        stock=$(stock_timing_value "$field") || continue
+        "$FBPA_REGS" set "$field" "$stock" >/dev/null 2>&1 || true
+    done
+}
+
+reject_hbm_profile() {
+    local timings=${1:-} reason=${2:-failed}
+    say "${c_bad}HBM PROFILE REJECTED: $reason; reverting HBM to stock${c_off}"
+    mclk_revert
+    restore_hbm_timings "$timings"
+    disarm
+    return 1
+}
+
+cmd_hbm_gate() {
+    local ndiv="" timings="" sweeps=4 workload="" normalized rc xids_before xids_after sweep_fraction_milli
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ndiv) ndiv=${2:?--ndiv needs a value}; shift 2 ;;
+            --timings) timings=${2:?--timings needs FIELD VALUE pairs}; shift 2 ;;
+            --sweeps) sweeps=${2:?--sweeps needs a count}; shift 2 ;;
+            --workload) workload=${2:?--workload needs a command}; shift 2 ;;
+            *) die "unknown hbm-gate argument '$1'" ;;
+        esac
+    done
+    [ -n "$ndiv" ] || die "usage: hbm-gate --ndiv N [--timings \"FIELD VALUE ...\"] [--sweeps N] [--workload COMMAND]"
+    [[ "$ndiv" =~ ^[0-9]+$ ]] || die "invalid NDIV '$ndiv'"
+    [[ "$sweeps" =~ ^[0-9]+$ ]] && [ "$sweeps" -gt 0 ] || die "invalid sweep count '$sweeps'"
+    sweep_fraction_milli=$(fraction_to_milli "${SWEEP_FRAC:-0.95}") || die "invalid SWEEP_FRAC '${SWEEP_FRAC:-0.95}'"
+    [ "$sweep_fraction_milli" -ge 950 ] || die "hbm-gate qualification requires SWEEP_FRAC >= 0.95"
+    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
+    [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
+    [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST"
+    [ -x "$COMPUTE" ] && [ "$GATE_COMPUTE" -gt 0 ] || die "hbm-gate requires the compute checker"
+    refuse_if_mclk_baked "hbm-gate"
+    wedged && die "GPU is wedged - run 'recover' first"
+    ctx_dead && die "GPU answers but takes no CUDA context - run 'recover' first"
+    normalized=$(normalize_timings "$timings") || return 1
+    validate_rollbackable_timings "$normalized" || return 1
+    xids_before=$(xids || true); xids_before=${xids_before:-0}
+    apply_hbm_timings "$normalized" || { reject_hbm_profile "$normalized" "timing apply/readback failed"; return 1; }
+    "$HBM_MCLK" set "$ndiv" >/dev/null 2>&1 || { reject_hbm_profile "$normalized" "NDIV $ndiv did not lock"; return 1; }
+    verify_hbm_profile "$ndiv" "$normalized" || { reject_hbm_profile "$normalized" "initial readback failed"; return 1; }
+    _hot_gate_sweeps "$sweeps" "hbm-profile-$(hbm_profile_id "$ndiv" "$normalized")" "$MCLK_GATE_SOAK_MAX" || {
+        reject_hbm_profile "$normalized" "hot correctness gate failed"
+        return 1
+    }
+    if [ -n "$workload" ]; then
+        say "  workload: $workload"
+        arm "hbm-workload" "$ndiv"
+        timeout "$WORKLOAD_TIMEOUT" bash -c "$workload"; rc=$?
+        disarm
+        [ "$rc" -eq 0 ] || { reject_hbm_profile "$normalized" "workload failed (exit $rc)"; return 1; }
+    else
+        rc=0
+    fi
+    verify_hbm_profile "$ndiv" "$normalized" || { reject_hbm_profile "$normalized" "final readback failed"; return 1; }
+    xids_after=$(xids || true); xids_after=${xids_after:-0}
+    [ "$xids_after" -le "$xids_before" ] || { reject_hbm_profile "$normalized" "new Xid detected"; return 1; }
+    write_hbm_receipt "$ndiv" "$normalized" "$LAST_GATE_SWEEPS" "$LAST_GATE_PEAK_HBM" \
+        "$workload" "$rc" "$LAST_GATE_SWEEP_MODE" "$LAST_GATE_SWEEP_FRAC_MILLI" >/dev/null
+    say "${c_ok}HBM PROFILE QUALIFIED: NDIV $ndiv timings '$normalized' on card $(serial)${c_off}"
 }
 
 cmd_mclk_try() {
@@ -1246,6 +1609,8 @@ Type=oneshot
 Environment=HBM_MCLK=$HBM_MCLK
 Environment=FBPA_REGS=$FBPA_REGS
 Environment=NVML=$NVML
+Environment=CTXPROBE=$CTXPROBE
+Environment=CTX_TIMEOUT=$CTX_TIMEOUT
 ExecStart=$SELF boot-apply
 RemainAfterExit=no
 
@@ -1324,6 +1689,93 @@ sm_receipt_gate() {
     return 0
 }
 
+PERSIST_NDIV=""
+PERSIST_OFFSET=""
+PERSIST_CLK=""
+PERSIST_TIMINGS=""
+PERSIST_HBM_FORCED=0
+
+load_persist_config() {
+    local file=$1 line key value seen=""
+    PERSIST_NDIV=""; PERSIST_OFFSET=""; PERSIST_CLK=""; PERSIST_TIMINGS=""; PERSIST_HBM_FORCED=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in
+            NDIV=*)       key=NDIV;       value=${line#NDIV=} ;;
+            OFFSET=*)     key=OFFSET;     value=${line#OFFSET=} ;;
+            CLK=*)        key=CLK;        value=${line#CLK=} ;;
+            TIMINGS=*)    key=TIMINGS;    value=${line#TIMINGS=} ;;
+            HBM_FORCED=*) key=HBM_FORCED; value=${line#HBM_FORCED=} ;;
+            *) say "${c_bad}invalid persist config line: $line${c_off}"; return 1 ;;
+        esac
+        case " $seen " in *" $key "*)
+            say "${c_bad}duplicate persist config key: $key${c_off}"; return 1 ;;
+        esac
+        seen="$seen $key"
+        if [ "$key" = TIMINGS ]; then
+            case "$value" in
+                \"*\") value=${value#\"}; value=${value%\"} ;;
+                '') ;;
+                *) say "${c_bad}TIMINGS must be an empty value or one double-quoted line${c_off}"; return 1 ;;
+            esac
+        fi
+        case "$key" in
+            NDIV) PERSIST_NDIV=$value ;;
+            OFFSET) PERSIST_OFFSET=$value ;;
+            CLK) PERSIST_CLK=$value ;;
+            TIMINGS) PERSIST_TIMINGS=$value ;;
+            HBM_FORCED) PERSIST_HBM_FORCED=$value ;;
+        esac
+    done < "$file"
+}
+
+validate_persisted_sm() {
+    local off=${1:-} clk=${2:-}
+    if [ -z "$off" ] && [ -z "$clk" ]; then return 0; fi
+    [ -n "$off" ] && [ -n "$clk" ] || {
+        say "${c_bad}stored SM profile must contain both OFFSET and CLK${c_off}"
+        return 1
+    }
+    [[ "$off" =~ ^[+-]?[0-9]+$ ]] || {
+        say "${c_bad}stored SM OFFSET is invalid: '$off'${c_off}"
+        return 1
+    }
+    [[ "$clk" =~ ^[0-9]+$ ]] && [ "$clk" -gt 0 ] || {
+        say "${c_bad}stored SM CLK is invalid: '$clk'${c_off}"
+        return 1
+    }
+}
+
+validate_persisted_hbm() {
+    local ndiv=${1:-} timings=${2:-} forced=${3:-0} normalized
+    normalized=$(normalize_timings "$timings") || return 1
+    [ -z "$normalized" ] || [ -n "$ndiv" ] || {
+        say "${c_bad}stored HBM timings have no NDIV; the combined profile cannot be identified${c_off}"
+        return 1
+    }
+    [ -z "$ndiv" ] || [[ "$ndiv" =~ ^[0-9]+$ ]] || {
+        say "${c_bad}stored HBM NDIV is invalid: '$ndiv'${c_off}"
+        return 1
+    }
+    case "$forced" in 0|1) ;; *)
+        say "${c_bad}stored HBM_FORCED marker is invalid: '$forced'${c_off}"
+        return 1
+    esac
+    if { [ -z "$ndiv" ] || [ "$ndiv" = "$STOCK_NDIV" ]; } && [ -z "$normalized" ]; then
+        return 0
+    fi
+    validate_rollbackable_timings "$normalized" || return 1
+    if [ "$forced" = 1 ]; then
+        say "${c_warn}FORCED HBM profile: accepting explicit unqualified override${c_off}"
+        return 0
+    fi
+    hbm_receipt_gate "$ndiv" "$normalized" 0 || {
+        say "  qualify this exact profile first: 170tune hbm-gate --ndiv $ndiv${normalized:+ --timings \"$normalized\"}"
+        return 1
+    }
+}
+
 # HARDWARE-TEST-GATED SECTION (persist unification). cmd_persist is the single unified
 # persistence command for BOTH the SM point (offset/clk) and the HBM point (NDIV/timings) - one
 # conf per serial under $PERSIST, one systemd unit (170tune-persist.service via boot-apply below)
@@ -1339,7 +1791,7 @@ cmd_persist() {
             [ -n "$s" ] || die "no serial - is a card installed?"
             refuse_if_mclk_baked "persist save"
             mkdir -p "$PERSIST"
-            local ndiv="" off="" clk="" tim="" profname="" force=0
+            local ndiv="" off="" clk="" tim="" profname="" force=0 hbm_forced=0
             while [ $# -ge 1 ]; do case "$1" in
                 --ndiv) ndiv=$2; shift 2 ;; --offset) off=$2; shift 2 ;;
                 --clk) clk=$2; shift 2 ;; --timings) tim=$2; shift 2 ;;
@@ -1352,11 +1804,26 @@ cmd_persist() {
                 [ -n "${off:-}" ] || die "unknown profile '$profname' - see '170tune --help' for the list, or use --offset/--clk directly"
                 say "resolved profile '$profname' -> offset +$off, ceiling $clk"
             fi
+            validate_persisted_sm "$off" "$clk" || die "refusing malformed SM profile"
             if [ -n "${off:-}" ] && [ -n "${clk:-}" ]; then
                 sm_receipt_gate "$off" "$clk" "$force" || die "refusing to persist an unproven SM point (see above); use --force to override"
             fi
-            { echo "# 170tune persist profile for $s ($(date -Is)) - only GATED values belong here"
-              echo "NDIV=${ndiv}"; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS=\"${tim}\""
+            tim=$(normalize_timings "$tim") || die "refusing malformed HBM timings"
+            [ -z "$tim" ] || [ -n "$ndiv" ] ||
+                die "--timings requires --ndiv so the exact combined HBM profile can be qualified"
+            [ -z "$ndiv" ] || [[ "$ndiv" =~ ^[0-9]+$ ]] || die "invalid NDIV '$ndiv'"
+            validate_rollbackable_timings "$tim" || die "refusing HBM timings without a stock rollback value"
+            if { [ -n "$ndiv" ] && [ "$ndiv" != "$STOCK_NDIV" ]; } || [ -n "$tim" ]; then
+                hbm_receipt_gate "$ndiv" "$tim" "$force" ||
+                    die "refusing to persist an unqualified HBM profile; run: 170tune hbm-gate --ndiv $ndiv${tim:+ --timings \"$tim\"}"
+                hbm_forced=$HBM_RECEIPT_FORCED
+            fi
+            { if [ "$hbm_forced" = 1 ]; then
+                  echo "# 170tune persist profile for $s ($(date -Is)) - unqualified forced HBM override"
+              else
+                  echo "# 170tune persist profile for $s ($(date -Is)) - only GATED values belong here"
+              fi
+              echo "NDIV=${ndiv}"; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS=\"${tim}\""; echo "HBM_FORCED=${hbm_forced}"
               [ -n "$profname" ] && echo "# profile: $profname"
             } > "$PERSIST/$s.conf"
             say "${c_ok}saved $PERSIST/$s.conf${c_off}"; sed 's/^/   /' "$PERSIST/$s.conf"
@@ -1365,9 +1832,20 @@ cmd_persist() {
         enable)
             need_root persist enable
             [ -f "$PERSIST/$s.conf" ] || die "no profile for $s yet - run 'persist save' first"
+            load_persist_config "$PERSIST/$s.conf" || die "refusing malformed persist config"
+            local NDIV=$PERSIST_NDIV OFFSET=$PERSIST_OFFSET CLK=$PERSIST_CLK
+            local TIMINGS=$PERSIST_TIMINGS HBM_FORCED=$PERSIST_HBM_FORCED
+            validate_persisted_sm "$OFFSET" "$CLK" ||
+                die "refusing to enable a malformed stored SM profile"
+            validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED" ||
+                die "refusing to enable a stored HBM profile without valid qualification evidence"
             install_persist_unit
             systemctl daemon-reload; systemctl enable 170tune-persist.service >/dev/null 2>&1
-            say "${c_ok}170tune-persist.service enabled - the qualified profile re-applies each boot${c_off}"
+            if [ "$HBM_FORCED" = 1 ]; then
+                say "${c_warn}170tune-persist.service enabled - the unqualified forced HBM override re-applies each boot${c_off}"
+            else
+                say "${c_ok}170tune-persist.service enabled - the qualified profile re-applies each boot${c_off}"
+            fi
             say "  recover remotely if a profile misbehaves: systemctl mask 170tune-persist.service (boot stays stock)"
             ;;
         disable)
@@ -1384,6 +1862,17 @@ cmd_persist() {
             fi
             ;;
     esac
+}
+
+revert_boot_profile() {
+    local reason=${1:-runtime-health-failure} timings=${2:-}
+    logger -t 170tune "boot-apply: $reason; reverting to stock"
+    "$NVML" 0 0 >/dev/null 2>&1 || true
+    nvidia-smi -rgc >/dev/null 2>&1 || true
+    mclk_revert
+    restore_hbm_timings "$timings" || true
+    disarm
+    return 1
 }
 
 # ExecStart of the persist service. Self-disarming: if a marker from a PRIOR boot
@@ -1413,33 +1902,56 @@ cmd_boot_apply() {
             exit 0
         fi
     fi
-    # shellcheck disable=SC1090
-    . "$conf"
-    arm "persist-$s" "${NDIV:-0}"
-    logger -t 170tune "boot-apply: applying $s NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
-    [ -n "${OFFSET:-}" ] && "$NVML" "${OFFSET}" 0 >/dev/null 2>&1
-    [ -n "${CLK:-}" ] && nvidia-smi -lgc "210,${CLK}" >/dev/null 2>&1
-    if [ -n "${TIMINGS:-}" ] && [ -x "$FBPA_REGS" ]; then
-        # shellcheck disable=SC2086
-        set -- ${TIMINGS}; while [ $# -ge 2 ]; do "$FBPA_REGS" set "$1" "$2" >/dev/null 2>&1; shift 2; done
+    load_persist_config "$conf" || {
+        logger -t 170tune "boot-apply: malformed persist config; staying stock"
+        return 1
+    }
+    local NDIV=$PERSIST_NDIV OFFSET=$PERSIST_OFFSET CLK=$PERSIST_CLK
+    local TIMINGS=$PERSIST_TIMINGS HBM_FORCED=$PERSIST_HBM_FORCED
+    if ! validate_persisted_sm "$OFFSET" "$CLK"; then
+        logger -t 170tune "boot-apply: SM config validation failed; staying stock"
+        return 1
     fi
-    if [ -n "${NDIV:-}" ] && [ "${NDIV}" != "$STOCK_NDIV" ] && [ -x "$HBM_MCLK" ]; then
-        if "$HBM_MCLK" set "${NDIV}" >/dev/null 2>&1; then
-            # Bare NDIV by default (robust). The DDLL recal is opt-in and non-deterministic; only
-            # apply it when the persisted profile is a recal-extended (>bare-ceiling) point.
-            [ -n "${MCLK_RECAL:-}" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
-        else
-            logger -t 170tune "boot-apply: NDIV ${NDIV} did not lock; left stock"
+    if ! validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED"; then
+        logger -t 170tune "boot-apply: HBM receipt validation failed; staying stock"
+        return 1
+    fi
+    local xids_before xids_after hbm_state=stock
+    if { [ -n "$NDIV" ] && [ "$NDIV" != "$STOCK_NDIV" ]; } || [ -n "$TIMINGS" ]; then
+        if [ "$HBM_FORCED" = 1 ]; then hbm_state=forced; else hbm_state=qualified; fi
+    fi
+    xids_before=$(xids || true); xids_before=${xids_before:-0}
+    arm "persist-$s" "${NDIV:-0}"
+    logger -t 170tune "boot-apply: applying $s HBM=$hbm_state NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
+    if [ -n "${OFFSET:-}" ] && ! "$NVML" "${OFFSET}" 0 >/dev/null 2>&1; then
+        revert_boot_profile "SM offset apply failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "${CLK:-}" ] && ! nvidia-smi -lgc "210,${CLK}" >/dev/null 2>&1; then
+        revert_boot_profile "SM clock-lock apply failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "$TIMINGS" ] && ! apply_hbm_timings "$TIMINGS"; then
+        revert_boot_profile "HBM timing apply/readback failed" "$TIMINGS"; return 1
+    fi
+    if [ -n "$NDIV" ] && [ "$NDIV" != "$STOCK_NDIV" ]; then
+        if [ ! -x "$HBM_MCLK" ] || ! "$HBM_MCLK" set "$NDIV" >/dev/null 2>&1; then
+            revert_boot_profile "HBM NDIV $NDIV failed to lock" "$TIMINGS"; return 1
         fi
+        # Bare NDIV by default (robust). The DDLL recal is opt-in and non-deterministic; only
+        # apply it when the persisted profile is a recal-extended (>bare-ceiling) point.
+        [ -n "${MCLK_RECAL:-}" ] && "$HBM_MCLK" ddll >/dev/null 2>&1
+    fi
+    if [ -n "$NDIV" ] && ! verify_hbm_profile "$NDIV" "$TIMINGS"; then
+        revert_boot_profile "HBM profile readback failed" "$TIMINGS"; return 1
     fi
     sleep 2
-    if wedged || [ "$(xids)" -gt 0 ]; then
-        logger -t 170tune "boot-apply: post-apply health check FAILED; reverting to stock"
-        "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; mclk_revert
-        disarm; exit 1
+    if wedged; then revert_boot_profile "runtime wedge detected" "$TIMINGS"; return 1; fi
+    if ctx_dead; then revert_boot_profile "CUDA context probe failed" "$TIMINGS"; return 1; fi
+    xids_after=$(xids || true); xids_after=${xids_after:-0}
+    if [ "$xids_after" -gt "$xids_before" ]; then
+        revert_boot_profile "new Xid detected" "$TIMINGS"; return 1
     fi
     disarm
-    logger -t 170tune "boot-apply: profile $s applied and healthy"
+    logger -t 170tune "boot-apply: profile $s applied and healthy (HBM=$hbm_state)"
 }
 
 # --------------------------------------------------------------- migration (HARDWARE-TEST-GATED)
@@ -1875,6 +2387,8 @@ HBM MEMORY LEVERS (live userspace BAR0 - no driver rebuild; the unlock opens the
   mclk-try   <NDIV>           set the HBM clock live (NDIV*27 MHz), prove it moved. UNVERIFIED.
   mclk-gate  <NDIV> [n]       the proof: core pinned stock, n hot full-VRAM sweeps + compute.
                               A cold gate is a FAILURE - HBM silent corruption is temp-dependent.
+  hbm-gate --ndiv N [--timings "FIELD VALUE ..."] [--sweeps N] [--workload "COMMAND"]
+                              qualify the exact combined HBM profile and write its per-card receipt.
   mclk-ladder [start] [step] [max]
                               walk NDIV up (default 65 1 80), gate each rung hot, stop at the
                               first that runs but fails the gate. Leaves the card on the highest
@@ -1938,6 +2452,7 @@ ENVIRONMENT
   CTX_TIMEOUT=60        context probe timeout; a probe that hangs is treated as a wedge
   CTXPROBE=/path        the context probe (default: the ctx_probe installed here)
   BENCH=/path           the SM integrity sweep (default: the 170hx-sweep installed here)
+  SWEEP_FRAC=0.95       resident HBM sweep coverage; hbm-gate qualification requires >=0.95
   COMPUTE=/path         the compute checker        NVML=/path   nvml_oc
   MCLK_GATE_SOAK_MAX=360  soak budget for mclk-gate/mclk-ladder (mclk rungs cool faster)
   MCLK_TUNE=1            apply the per-NDIV timing tune during mclk-gate/ladder (extends 76->77)
@@ -1995,6 +2510,7 @@ case "${1:-}" in
     mclk-status) shift; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"; need_root mclk-status; "$HBM_MCLK" get ;;
     mclk-try)    shift; need_root mclk-try "$@"; cmd_mclk_try "$@" ;;
     mclk-gate)   shift; need_root mclk-gate "$@"; cmd_mclk_gate "$@" ;;
+    hbm-gate)    shift; need_root hbm-gate "$@"; cmd_hbm_gate "$@" ;;
     mclk-ladder) shift; need_root mclk-ladder "$@"; cmd_mclk_ladder "$@" ;;
     hbm-matrix)  shift; need_root hbm-matrix "$@"; cmd_hbm_matrix "$@" ;;
     refresh)      shift; need_root refresh "$@"; cmd_refresh "$@" ;;
@@ -2008,5 +2524,20 @@ case "${1:-}" in
     install)         shift; need_root install "$@"; cmd_install "$@" ;;
     preflight)        shift; cmd_preflight "$@" ;;
     snapshot-stock)   shift; need_root snapshot-stock "$@"; cmd_snapshot_stock "$@" ;;
+    receipt-test)
+        [ "${TUNE_TEST_MODE:-}" = 1 ] || die "receipt-test is test-only"
+        shift
+        case "${1:-}" in
+            id) shift; hbm_profile_id "${1:?ndiv}" "${2:-}" ;;
+            validate) shift; hbm_receipt_gate "${1:?ndiv}" "${2:-}" 0 ;;
+            validate-force)
+                shift
+                hbm_receipt_gate "${1:?ndiv}" "${2:-}" 1
+                printf 'forced=%s\n' "$HBM_RECEIPT_FORCED"
+                ;;
+            write) shift; write_hbm_receipt "${1:?ndiv}" "${2:-}" "${3:?sweeps}" "${4:?peak}" "${5:-}" "${6:-0}" ;;
+            *) die "usage: receipt-test {id|validate|validate-force|write} <ndiv> <timings> ..." ;;
+        esac
+        ;;
     *) cmd_help; exit 2 ;;
 esac
