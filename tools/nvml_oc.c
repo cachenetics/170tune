@@ -16,6 +16,22 @@
 #define TRY(call) do { nvmlReturn_t r = (call); \
   printf("  %-46s -> %s\n", #call, nvmlErrorString(r)); } while (0)
 
+// atoi() returns 0 on anything it can't parse, so a stray flag like "--offset" silently becomes
+// a valid-looking 0 MHz instead of an error - seen in the wild as `nvml_oc --offset 250 --clk 1400`
+// (170hx-oc/170tune flags, not this binary's), which landed as gpc=+0 mem=+250 with no complaint.
+static int strict_int(const char *s, const char *what) {
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0') {
+        fprintf(stderr, "nvml_oc: %s '%s' is not an integer\n"
+                        "usage: nvml_oc [-i devIdx] | nvml_oc <gpcMHz> <memMHz> [devIdx]\n"
+                        "  (the --offset/--clk flags belong to 170hx-oc / 170tune, not this binary)\n",
+                what, s);
+        exit(1);
+    }
+    return (int)v;
+}
+
 int main(int argc, char **argv) {
     nvmlReturn_t r = nvmlInit_v2();
     if (r != NVML_SUCCESS) { printf("nvmlInit: %s\n", nvmlErrorString(r)); return 1; }
@@ -75,7 +91,7 @@ int main(int argc, char **argv) {
 #endif
 
     if (argc - a >= 2) {
-        int gpc = atoi(argv[a]), mem = atoi(argv[a + 1]);
+        int gpc = strict_int(argv[a], "gpcMHz"), mem = strict_int(argv[a + 1], "memMHz");
         int setGpc = 1, setMem = 1;   // 0 is a VALID offset (= stock), always apply
         printf("\napplying offsets: gpc=%+d MHz  mem=%+d MHz\n", gpc, mem);
         if (setGpc) {
@@ -100,6 +116,14 @@ int main(int argc, char **argv) {
         nvmlDeviceGetGpcClkVfOffset(d, &g);
         nvmlDeviceGetMemClkVfOffset(d, &m);
         printf("readback: gpc=%+d  mem=%+d MHz\n", g, m);
+        // NVML returns Success for a write the driver silently drops (seen on MEM, whose range
+        // is [0..0] on this SKU - see README). Success does not mean applied; readback does.
+        if (g != gpc) printf("WARNING: GPC offset requested %+d MHz but reads back %+d MHz - "
+                              "the driver refused the write despite reporting Success\n", gpc, g);
+        if (m != mem) printf("WARNING: MEM offset requested %+d MHz but reads back %+d MHz - "
+                              "the driver refused the write despite reporting Success "
+                              "(MEM VF offset is locked on this SKU; use the BAR0 NDIV lever "
+                              "instead, e.g. 170tune mclk-status)\n", mem, m);
         unsigned int sm = 0, mc = 0;
         nvmlDeviceGetClockInfo(d, NVML_CLOCK_SM, &sm);
         nvmlDeviceGetClockInfo(d, NVML_CLOCK_MEM, &mc);
