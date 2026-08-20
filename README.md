@@ -289,7 +289,9 @@ tried. Two regimes:
 For the HBM side (memory clock, DRAM timings, refresh lever) see `explain-hbm` and
 [`docs/hbm-matrix.md`](docs/hbm-matrix.md). The long-form SM findings are in
 [`docs/tuning-guide.md`](docs/tuning-guide.md); the full offset x ceiling matrix is in
-[`docs/measurement-matrix.md`](docs/measurement-matrix.md).
+[`docs/measurement-matrix.md`](docs/measurement-matrix.md). For choosing a sustained/delivery
+envelope with a POWER CAP (offset x power-cap curve, the efficiency knee, thermal soak) see
+[`docs/power-cap-curve.md`](docs/power-cap-curve.md).
 
 ## Environment knobs
 
@@ -339,6 +341,7 @@ tools/setup-vllm-170hx.sh     stand vLLM up on a 170HX from scratch; refuses ten
                           over Gen2 x4, fails on a still-locked VBIOS, pins the card by UUID
 docs/tuning-guide.md          the long-form SM findings
 docs/measurement-matrix.md    the full SM offset x clock-ceiling measurement matrix
+docs/power-cap-curve.md       the offset x power-cap curve, the 175W efficiency knee, delivery envelope
 docs/hbm-matrix.md            the canonical HBM tuning matrix: NDIV grid, ceilings, refresh lever
 docs/hbm-timing-understanding.md  the mechanistic HBM model: per-field ns floors and which timing
                           binds as NDIV rises (the "why" behind the matrix)
