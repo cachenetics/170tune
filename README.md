@@ -20,6 +20,7 @@ stock**, so a bad profile is masked over ssh, never a brick.
 - [Tune the SM](#tune-the-sm-gpc-clock--voltage) / [Tune the memory (HBM)](#tune-the-memory-hbm)
 - [Production profiles](#production-profiles) - what to actually ship
 - [Persist across reboots](#persist-across-reboots)
+- [Multiple cards](#multiple-cards) - the per-card selector and per-card qualification
 - [Safety](#safety) - the failure modes and the guards
 - [How the SM undervolt works](#how-the-sm-undervolt-works) - the mechanism, with numbers
 - [Environment knobs](#environment-knobs) / [Repo contents](#repo-contents)
@@ -199,6 +200,34 @@ timings. Boot never calls the full-VRAM sweep, compute gate, hot soak, or extern
 Recover a misbehaving profile remotely with `systemctl mask 170tune-persist.service` (boot stays
 stock) or `170tune persist disable`. A box still on the earlier per-profile `170hx-oc.service` model
 is migrated automatically the next time `170tune install` runs.
+
+## Multiple cards
+
+On a host with more than one 170HX, every command takes a `-i N` / `--gpu N` selector (or `GPU=N` in
+the environment) naming which card to act on; the default is index 0 as `nvidia-smi` numbers them.
+Selection is order-proof: the tool binds `nvidia-smi`/NVML by that index, pins the CUDA helper tools
+by UUID (`CUDA_DEVICE_ORDER=PCI_BUS_ID`), and addresses the HBM register tools by PCI BDF, so the
+card a gate proves is always the card the overclock lands on.
+
+Qualification is per-card. A gate receipt, a persisted profile (`/var/lib/170tune/persist/<serial>.conf`,
+which now records `OC_SERIAL`), and a quarantine are all keyed to the card's serial, because a point
+that soaks clean on one card says nothing about another. So tune each card under its own selector:
+
+```
+170tune -i 0 qualify 1350
+170tune -i 1 qualify 1350
+170tune -i 1 persist save --profile eff
+170tune -i 1 persist enable     # validates card 1's profile, installs the one shared boot service
+```
+
+`persist enable` installs a single boot service and validates the selected card's profile; run it once
+under any card that has a saved profile. At boot that service applies EACH present card's own profile
+to that card.
+
+`apply` and `reset` act only on the selected card and stamp `OC_SERIAL`, so the applier never touches
+a card the profile was not qualified for. `boot-apply` walks every present card and applies each
+card's own persisted profile independently; if a card's apply fails it is reverted to stock and the
+others still proceed. `boot-check` reverts every present card to stock after a crash.
 
 ## Safety
 

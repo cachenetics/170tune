@@ -39,7 +39,9 @@ find_bin() { local p; for p in "$@"; do [ -x "$p" ] && { printf '%s' "$p"; retur
 SELFTEST=${SELFTEST:-$(find_bin /usr/local/bin/gpu_selftest "$(dirname "$(readlink -f "$0")")/gpu_selftest")}
 [ -x "$SELFTEST" ] || { echo "170hx-sweep: gpu_selftest not found (build it: see install.sh)" >&2; exit 2; }
 
-export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+# Honour a pin the caller already set (170tune exports CUDA_VISIBLE_DEVICES=<uuid>, which is
+# order-proof for identical cards); fall back to GPU=<index> when run standalone.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU:-0}}"
 out=$("$SELFTEST" "$FRAC" 2>&1); rc=$?
 
 get() { printf '%s\n' "$out" | grep -oE "^$1=.*" | head -1 | cut -d= -f2-; }
