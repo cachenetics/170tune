@@ -118,8 +118,19 @@ cat > "$TMP/bin/nvidia-smi" <<'STUB'
 set -u
 c=${TEST_ROOT:?}/control
 printf 'nvidia-smi %s\n' "$*" >> "${TEST_ROOT}/calls.log"
+# Optional device selector: -i N. Multi-GPU (issue #4) is modelled by control/gpus, lines of
+# "idx,serial,bus_id"; absent it, a single card at index 0 with control/serial (legacy behaviour).
+idx=""; prev=""
+for a in "$@"; do [ "$prev" = "-i" ] && idx="$a"; prev="$a"; done
+gpus() { if [ -s "$c/gpus" ]; then cat "$c/gpus"; else printf '0,%s,00000000:01:00.0\n' "$(cat "$c/serial")"; fi; }
+field_for() { gpus | awk -F, -v i="${1:-0}" -v col="$2" '$1==i{print $col; f=1} END{exit f?0:1}'; }
 case "$*" in
-    *--query-gpu=serial*) cat "$c/serial" ;;
+    # enumeration + identity FIRST (index,serial must beat serial; uuid,pci before others)
+    *--query-gpu=index,serial*)    gpus | awk -F, '{print $1", "$2}' ;;
+    *--query-gpu=uuid,pci.bus_id*) b=$(field_for "${idx:-0}" 3); [ -n "$b" ] || b=00000000:01:00.0
+                                   printf 'GPU-test-uuid-%s, %s\n' "${idx:-0}" "$b" ;;
+    *--query-gpu=index*)           gpus | awk -F, '{print $1}' ;;
+    *--query-gpu=serial*)          if [ -n "$idx" ] && s=$(field_for "$idx" 2); then printf '%s\n' "$s"; else cat "$c/serial"; fi ;;
     *--query-gpu=pci.device_id*) cat "$c/devid" ;;
     *--query-gpu=driver_version*) cat "$c/driver" ;;
     *--query-gpu=vbios_version*) cat "$c/vbios" ;;
@@ -887,11 +898,78 @@ EOF
     : > "$TMP/calls.log"
     run_tune boot-apply >/dev/null 2>&1 ||
         fail "legacy SM-only profile was rejected at boot"
-    grep -q '^nvml_oc 100 0' "$TMP/calls.log" || fail "SM offset was not applied"
+    grep -q '^nvml_oc -i 0 100 0' "$TMP/calls.log" || fail "SM offset was not applied to the selected card"
     if grep -qE '^(hbm_mclk set|fbpa_regs set)' "$TMP/calls.log"; then
         fail "SM-only boot unexpectedly wrote HBM state"
     fi
     printf 'PASS: boot apply keeps legacy SM-only profiles compatible\n'
+}
+
+# --- multi-GPU (issue #4) -----------------------------------------------------------------------
+two_card_gpus() {
+    cat > "$TMP/control/gpus" <<EOF
+0,SERIAL0,00000000:01:00.0
+1,SERIAL1,00000000:a1:00.0
+EOF
+}
+
+test_multi_gpu_boot_apply_targets_only_the_saved_card() {
+    reset_controls
+    two_card_gpus
+    # A profile saved for card 1 ONLY, recording its own OC_SERIAL.
+    cat > "$TMP/state/persist/SERIAL1.conf" <<EOF
+OC_SERIAL=SERIAL1
+NDIV=
+OFFSET=100
+CLK=1200
+TIMINGS=""
+EOF
+    : > "$TMP/calls.log"
+    run_tune boot-apply >/dev/null 2>&1 ||
+        fail "boot-apply rejected card 1's profile on a two-card box"
+    grep -q '^nvml_oc -i 1 100 0' "$TMP/calls.log" ||
+        fail "card 1's offset was not applied to card 1"
+    grep -q '^nvidia-smi -i 1 -lgc 210,1200' "$TMP/calls.log" ||
+        fail "card 1's clock ceiling was not applied to card 1"
+    if grep -q '^nvml_oc -i 0 100 0' "$TMP/calls.log"; then
+        fail "card 1's profile leaked onto card 0"
+    fi
+    rm -f "$TMP/control/gpus"
+    printf 'PASS: boot apply targets only the card that has a saved profile\n'
+}
+
+test_multi_gpu_boot_apply_rejects_serial_mismatch() {
+    reset_controls
+    two_card_gpus
+    # A conf filed under card 1 but naming card 0 - must NOT be applied to card 1.
+    cat > "$TMP/state/persist/SERIAL1.conf" <<EOF
+OC_SERIAL=SERIAL0
+NDIV=
+OFFSET=100
+CLK=1200
+TIMINGS=""
+EOF
+    : > "$TMP/calls.log"
+    if run_tune boot-apply >/dev/null 2>&1; then
+        fail "boot-apply accepted a conf whose OC_SERIAL names a different card"
+    fi
+    if grep -q '^nvml_oc -i 1 100 0' "$TMP/calls.log"; then
+        fail "a mismatched-serial profile was applied anyway"
+    fi
+    rm -f "$TMP/control/gpus"
+    printf 'PASS: boot apply refuses a profile whose OC_SERIAL names another card\n'
+}
+
+test_multi_gpu_selector_rejects_out_of_range_index() {
+    reset_controls
+    two_card_gpus
+    if run_tune -i 5 status >/dev/null 2>&1; then
+        fail "a nonexistent GPU index was accepted"
+    fi
+    run_tune -i 1 status >/dev/null 2>&1 ||
+        fail "valid GPU index 1 was rejected"
+    rm -f "$TMP/control/gpus"
+    printf 'PASS: the -i selector rejects an out-of-range index\n'
 }
 
 test_path_overrides_isolate_state
@@ -924,3 +1002,6 @@ test_boot_apply_rejects_stale_receipt_before_writes
 test_boot_apply_logs_forced_profile
 test_persist_config_is_parsed_as_data
 test_boot_apply_keeps_old_sm_only_profile_compatible
+test_multi_gpu_boot_apply_targets_only_the_saved_card
+test_multi_gpu_boot_apply_rejects_serial_mismatch
+test_multi_gpu_selector_rejects_out_of_range_index

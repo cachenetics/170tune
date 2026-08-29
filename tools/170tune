@@ -8,6 +8,10 @@
 # So this tool separates "it ran" from "it is safe", records what it was doing before a hang, and
 # knows how to put the card back.
 #
+# A leading '-i N' / '--gpu N' (or GPU=N in the environment) selects which 170HX every command acts
+# on; default 0. Qualification is per-card (receipts/profiles/quarantine are keyed to the serial), so
+# tune each card under its own '-i'. See the MULTI-GPU section in '170tune --help'.
+#
 # Commands:
 #   explain                        the SM clock/voltage levers, the two regimes, failure modes
 #   explain-hbm                    the HBM memory levers: clock, timings, refresh, how they interact
@@ -85,6 +89,10 @@ MCLK_RECAL=${MCLK_RECAL:-}
 # This card's STOCK DRAM timing cycle counts (read at NDIV 64). The timing tune scales the command
 # set from these to hold stock ns at a higher NDIV. Override per card if stock differs.
 STOCK_TIMINGS=${STOCK_TIMINGS:-"RC:67 RFC:657 RAS:43 RP:24 RD_RCD:27 WR_RCD:18 WR:25 FAW:22 RRD:5 W2R_BUS:8 R2W_BUS:8"}
+# Compiled/env stock defaults, captured once. resolve_gpu resets to these and then layers the
+# selected card's own snapshot (snapshot-stock) on top, so each card in a boot loop reverts to ITS
+# stock, never the startup card's.
+_STOCK_NDIV_DEF=$STOCK_NDIV; _STOCK_REFRESH_DEF=$STOCK_REFRESH; _STOCK_TIMINGS_DEF=$STOCK_TIMINGS
 # MCLK_TUNE=1 makes mclk-gate/ladder apply the custom-timing profile per NDIV (command timings scaled
 # to hold stock ns, + bus-turnaround 8->12 + CDLR 9->13). This is what extends the robust ceiling past
 # the bare limit (measured 76 bare -> 77 tuned), deterministically, with no DDLL recal.
@@ -101,10 +109,99 @@ say() { printf '%s\n' "$*"; }
 die() { printf '%s%s%s\n' "$c_bad" "$*" "$c_off" >&2; exit 1; }
 
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
-need_root() { [ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"; }
-serial() { nvidia-smi --query-gpu=serial --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
-devid()  { nvidia-smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
-xids()   { dmesg 2>/dev/null | grep -cE "Xid [0-9]|requires reset"; }
+need_root() {
+    # Carry the GPU selection across the privilege boundary in ARGV, not just the env: a sudoers
+    # policy that drops env vars would otherwise silently land the root child on card 0. Also announce
+    # the target card once, so no mutating command is ambiguous about which GPU it is touching.
+    if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" -i "${GPU_IDX:-0}" "$@"; fi
+    if [ -z "${_ROOT_BANNER:-}" ]; then
+        _ROOT_BANNER=1
+        local _sn; _sn=$(serial 2>/dev/null)
+        printf '170tune: acting on GPU %s%s\n' "$GPU_IDX" "${_sn:+ (serial $_sn)}" >&2
+    fi
+}
+
+# ---------------------------------------------------------------- GPU selection (issue #4: multi-GPU)
+# Every card-touching primitive is bound to ONE selected card, chosen with a leading '-i N' / '--gpu N'
+# (or GPU=N in the environment). Default 0, so single-card behaviour is unchanged. Three index spaces
+# have to name the SAME physical card or a gate would prove card A while the overclock lands on card B:
+#   * nvidia-smi index == NVML index (both PCI-bus order)      -> the smi()/nvml() wrappers pass -i.
+#   * CUDA index is order-dependent for identical cards        -> CUDA_DEVICE_ORDER=PCI_BUS_ID makes it
+#                                                                 equal to the nvidia-smi index, and
+#                                                                 CUDA_VISIBLE_DEVICES pins the tools.
+#   * hbm_mclk / fbpa_regs take a PCI BDF                       -> GPU_BDF (they read it from the env).
+# resolve_gpu() sets GPU_IDX/GPU_UUID/GPU_BDF and exports the env every child needs; it can be called
+# again (boot-apply loops it over every persisted card). GPU carries the choice across the sudo -E
+# re-exec, exactly as STATE/NVML already do.
+: "${GPU_IDX:=${GPU:-0}}"
+smi()  { nvidia-smi -i "$GPU_IDX" "$@"; }        # bind every nvidia-smi read/write to the selected card
+nvml() { "$NVML" -i "$GPU_IDX" "$@"; }           # nvml_oc -i <idx> works for both report and set forms
+# Per-card stock revert target: reset to the compiled/env defaults, then source the SELECTED card's
+# snapshot (snapshot-stock writes STOCK_NDIV/STOCK_REFRESH/STOCK_TIMINGS under $STATE/stock/<serial>).
+load_stock_override() {
+    STOCK_NDIV=$_STOCK_NDIV_DEF; STOCK_REFRESH=$_STOCK_REFRESH_DEF; STOCK_TIMINGS=$_STOCK_TIMINGS_DEF
+    local s; s=$(serial 2>/dev/null)
+    if [ -n "$s" ] && [ -f "$STATE/stock/$s.conf" ]; then
+        # shellcheck disable=SC1090
+        . "$STATE/stock/$s.conf"
+    fi
+}
+resolve_gpu() {
+    GPU_IDX=${1:-0}
+    [[ "$GPU_IDX" =~ ^[0-9]+$ ]] || die "GPU index must be a non-negative integer, got '$GPU_IDX'"
+    # Validate against the device COUNT first: nvidia-smi prints "No devices were found" to stdout for
+    # a bad -i and exits 0, so an emptiness check on the identity query would let a bad index through.
+    # Count only numeric index rows so that "No devices were found" reads as zero, not one.
+    local n; n=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | grep -c '^[0-9]')
+    if [ "${n:-0}" -eq 0 ]; then
+        # no nvidia-smi / no card at all: leave identity empty. Read-only/help still run; a mutating
+        # command dies later at its own is_170hx/tool guard.
+        GPU_UUID=""; GPU_BDF=""
+        export GPU="$GPU_IDX" CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDX" GPU_BDF=""
+        load_stock_override
+        return 0
+    fi
+    [ "$GPU_IDX" -lt "$n" ] || die "no GPU at index $GPU_IDX ($n present: valid 0..$((n - 1)))"
+    # One query gives identity. pci.bus_id is 00000000:01:00.0; sysfs/fbpa want 0000:01:00.0
+    # (4-digit domain, lowercase).
+    local line busid dom rest
+    line=$(nvidia-smi -i "$GPU_IDX" --query-gpu=uuid,pci.bus_id --format=csv,noheader 2>/dev/null | head -1)
+    GPU_UUID=$(printf '%s' "$line" | cut -d, -f1 | tr -d ' ')
+    busid=$(printf '%s' "$line" | cut -d, -f2 | tr -d ' ')
+    # The count above said this card exists; if the identity query still came back empty (a transient
+    # driver hiccup), die rather than export an empty CUDA_VISIBLE_DEVICES - an empty-but-set value
+    # makes 170hx-sweep's ${CUDA_VISIBLE_DEVICES:-...} fall back to INDEX selection, the very ambiguity
+    # the UUID pin exists to remove.
+    [ -n "$GPU_UUID" ] || die "could not resolve the identity of GPU $GPU_IDX (nvidia-smi returned no UUID); retry, the driver may be transiently wedged"
+    dom=${busid%%:*}; rest=${busid#*:}; dom=${dom: -4}
+    GPU_BDF="${dom}:${rest}"; GPU_BDF=${GPU_BDF,,}
+    # Pin CUDA by UUID, not index: for identical cards even CUDA_DEVICE_ORDER=PCI_BUS_ID only aligns
+    # CUDA to nvidia-smi when NVML enumerates ascending-by-BDF; a UUID is absolute and order-proof.
+    export GPU="$GPU_IDX" CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_UUID" GPU_BDF="$GPU_BDF"
+    # Reload the per-card stock revert target for THIS card (the boot loops call resolve_gpu per card).
+    load_stock_override
+}
+
+serial() { smi --query-gpu=serial --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+devid()  { smi --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' | tr 'A-Z' 'a-z'; }
+# Count Xid / reset events for the SELECTED card. The NVRM tag is "PCI:<domain>:<bus>:<dev>" with NO
+# function suffix (measured: "NVRM: Xid (PCI:0000:a1:00): 13 ..."), while GPU_BDF carries ".0"; both are
+# normalized to <bus>:<dev> before comparing. Drop ONLY a line whose tag names a DIFFERENT card - an
+# UNtagged line (older drivers, or a tag we cannot parse) is always counted, so this can never go
+# silently blind to a real fault (safe direction). On a busy multi-card box this stops a peer card's
+# Xid from failing this card's gate.
+xids() {
+    dmesg 2>/dev/null | grep -E "Xid [0-9]|requires reset" | awk -v bdf="${GPU_BDF:-}" '
+        function norm(s,   n, a) { sub(/\.[0-9A-Fa-f]+$/, "", s); n = split(s, a, ":"); return (n >= 2) ? tolower(a[n-1] ":" a[n]) : tolower(s) }
+        BEGIN { key = norm(bdf) }
+        {
+            if (bdf != "" && match($0, /PCI:[0-9A-Fa-f.:]+/)) {
+                if (norm(substr($0, RSTART + 4, RLENGTH - 4)) != key) next
+            }
+            c++
+        }
+        END { print c + 0 }'
+}
 
 # Canonical HBM profile identity. Persistence receipts must describe the exact
 # combined NDIV/timing state, independent of argument order or field case.
@@ -149,8 +246,8 @@ hbm_profile_id() {
     printf '%.16s\n' "$digest"
 }
 
-driver_version() { nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
-vbios_version()  { nvidia-smi --query-gpu=vbios_version  --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+driver_version() { smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+vbios_version()  { smi --query-gpu=vbios_version  --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
 
 hbm_receipt_file() {
     local ndiv=${1:?ndiv} timings=${2:-} profile_id
@@ -317,9 +414,9 @@ is_170hx() {
 
 wedged() {
     # a wedged GPU reports N/A for clocks and nvml_oc cannot read its offset
-    local c; c=$(nvidia-smi --query-gpu=clocks.sm --format=csv,noheader 2>&1 | head -1)
+    local c; c=$(smi --query-gpu=clocks.sm --format=csv,noheader 2>&1 | head -1)
     [[ "$c" == *"N/A"* || "$c" == *"Unable"* ]] && return 0
-    "$NVML" 2>&1 | grep -qi "requires reset" && return 0
+    nvml 2>&1 | grep -qi "requires reset" && return 0
     return 1
 }
 
@@ -354,6 +451,18 @@ ctx_dead() {
 # the marker survives the reboot and boot-check reports what killed it instead of losing it.
 arm() {
     mkdir -p "$STATE"
+    # The armed marker is a single file. If another card has a run in flight THIS boot, overwriting it
+    # would erase that card's crash evidence - boot-check/boot-apply would then miss a mid-apply crash.
+    # Refuse loudly instead of clobbering (tune one card at a time, or 'recover' the in-flight one).
+    if [ -f "$STATE/armed.json" ]; then
+        local es eb tb
+        es=$(grep -oE '"serial": "[^"]*"' "$STATE/armed.json" | cut -d'"' -f4)
+        eb=$(grep -oE '"boot_id": "[^"]+"' "$STATE/armed.json" | cut -d'"' -f4)
+        tb=$(cat /proc/sys/kernel/random/boot_id)
+        if [ "$eb" = "$tb" ] && [ -n "$es" ] && [ "$es" != "$(serial)" ]; then
+            die "another card (serial $es) has a tuning run in flight (armed.json). Finish it or run '170tune recover' before tuning $(serial)."
+        fi
+    fi
     cat > "$STATE/armed.json" <<EOF
 {"offset": $1, "ceiling": $2, "serial": "$(serial)", "started": "$(date -Is)", "boot_id": "$(cat /proc/sys/kernel/random/boot_id)"}
 EOF
@@ -430,10 +539,10 @@ cmd_unquarantine() {
 # ---------------------------------------------------------------- apply / read
 apply_point() {
     local off=$1 clk=$2
-    nvidia-smi -pm 1 >/dev/null 2>&1
-    nvidia-smi -pl 300 >/dev/null 2>&1
-    "$NVML" "$off" 0 >/dev/null 2>&1 || return 1
-    nvidia-smi -lgc "210,$clk" >/dev/null 2>&1 || return 1
+    smi -pm 1 >/dev/null 2>&1
+    smi -pl 300 >/dev/null 2>&1
+    nvml "$off" 0 >/dev/null 2>&1 || return 1
+    smi -lgc "210,$clk" >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -443,8 +552,8 @@ apply_point() {
 # Soak against HBM temperature, not core. The core reaches 52 C in seconds while the stacks are
 # still cold, and it is the MEMORY side that the pattern sweep is sensitive to: the run that first
 # caught +325/1400 had been driven to 59 C HBM. Targeting core temperature passed that same point.
-gpu_temp()  { nvidia-smi --query-gpu=temperature.memory --format=csv,noheader 2>/dev/null | tr -d ' '; }
-core_temp() { nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' '; }
+gpu_temp()  { smi --query-gpu=temperature.memory --format=csv,noheader 2>/dev/null | tr -d ' '; }
+core_temp() { smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' '; }
 soak_to_temp() {
     local target=${1:-$GATE_TEMP}
     local maxsecs=${2:-$GATE_SOAK_MAX}
@@ -465,12 +574,12 @@ soak_to_temp() {
 # via hbm_mclk does NOT move this number - nvidia-smi is blind to it (measured, see mclk_verify) -
 # so this function alone cannot see a live-tuned NDIV. See mclk_source() below, which combines this
 # with hbm_mclk's own direct register read to tell the two apart.
-mclk() { nvidia-smi --query-gpu=clocks.current.memory --format=csv,noheader,nounits 2>/dev/null \
+mclk() { smi --query-gpu=clocks.current.memory --format=csv,noheader,nounits 2>/dev/null \
          | head -1 | tr -d ' '; }
 
 # nvml_oc prints the offset signed ("+350 MHz"). Strip the sign so this can be COMPARED with a
 # profile's offset, not just displayed - 'persist save' checks the card actually took the setting.
-cur_offset() { "$NVML" 2>/dev/null | awk '/current offset/{v=($NF=="MHz")?$(NF-1):$NF; sub(/^\+/,"",v); print v; exit}'; }
+cur_offset() { nvml 2>/dev/null | awk '/current offset/{v=($NF=="MHz")?$(NF-1):$NF; sub(/^\+/,"",v); print v; exit}'; }
 
 # ---------------------------------------------------------------- subcommands
 cmd_explain() {
@@ -648,7 +757,7 @@ EOF
 }
 
 cmd_status() {
-    is_170hx || say "${c_warn}warning: GPU 0 device id $(devid) is not a 170HX${c_off}"
+    is_170hx || say "${c_warn}warning: GPU $GPU_IDX device id $(devid) is not a 170HX${c_off}"
     if wedged; then
         say "${c_bad}GPU IS WEDGED - run: 170tune recover${c_off}"
     elif ctx_dead; then
@@ -660,7 +769,7 @@ cmd_status() {
     # load - see the mclk misclassification guard in the HBM levers section below.
     printf 'memory clock: %s MHz  [%s]\n' "$(mclk)" "$(mclk_source)"
     printf 'offset      : %s MHz\n' "$(cur_offset)"
-    nvidia-smi --query-gpu=clocks.max.sm,clocks.sm,clocks.mem,power.limit,power.draw,temperature.gpu,temperature.memory,memory.total \
+    smi --query-gpu=clocks.max.sm,clocks.sm,clocks.mem,power.limit,power.draw,temperature.gpu,temperature.memory,memory.total \
         --format=csv 2>/dev/null | sed 's/^/            /'
     if [ -f "$STATE/armed.json" ]; then
         say "${c_warn}armed marker present (a run is in flight or did not check in):${c_off}"
@@ -679,7 +788,11 @@ cmd_status() {
 # try: one measured point. Returns 0 clean, 1 fault, 2 hang.
 cmd_try() {
     local off=${1:?offset} clk=${2:?ceiling} secs=${3:-10}
-    is_170hx || die "refusing: GPU 0 is not a 170HX (device id $(devid))"
+    # The selector goes BEFORE the subcommand; a trailing '-i' lands here as a bogus positional.
+    [[ "$off" =~ ^[+-]?[0-9]+$ ]] || die "offset must be an integer, got '$off' (the -i/--gpu selector goes before the subcommand: 170tune -i N try ...)"
+    [[ "$clk" =~ ^[0-9]+$ ]] && [ "$clk" -ge 1 ] || die "ceiling must be a positive integer, got '$clk'"
+    [[ "$secs" =~ ^[0-9]+$ ]] && [ "$secs" -ge 1 ] || die "seconds must be a positive integer, got '$secs'"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX (device id $(devid))"
     wedged && die "GPU is wedged - run 'recover' first"
     local x0; x0=$(xids)
     arm "$off" "$clk"
@@ -711,7 +824,12 @@ cmd_gate() {
     done
     set -- ${pos[@]+"${pos[@]}"}
     local off=${1:?offset} clk=${2:?ceiling} n=${3:-4}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    # Reject non-numeric args: a trailing '-i' (selector misplaced after the subcommand) would make
+    # n non-numeric, 'seq 1 -i' run ZERO sweeps, and the GATED verdict print without a single sweep.
+    [[ "$off" =~ ^[+-]?[0-9]+$ ]] || die "offset must be an integer, got '$off' (the -i/--gpu selector goes before the subcommand: 170tune -i N gate ...)"
+    [[ "$clk" =~ ^[0-9]+$ ]] && [ "$clk" -ge 1 ] || die "ceiling must be a positive integer, got '$clk'"
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || die "sweep count must be a positive integer, got '$n'"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"
     [ -x "$BENCH" ] || die "integrity gate not found at $BENCH - run '170tune install' to build 170hx-sweep, or set BENCH=/path to your own"
     apply_point "$off" "$clk" || die "could not apply offset=$off ceiling=$clk"
     say "gating offset=+$off ceiling=$clk: $n pattern sweeps + ${GATE_COMPUTE}s compute check, each soaked to ${GATE_TEMP}C HBM"
@@ -825,7 +943,7 @@ cmd_qualify() {
     mkdir -p "$STATE/results/$s"
     say "${c_hi}qualifying card $s at ceiling $clk${c_off}"
     say "-- baseline (stock)"
-    "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
+    nvml 0 0 >/dev/null 2>&1; smi -rgc >/dev/null 2>&1; smi -pl 250 >/dev/null 2>&1
     local base; base=$(timeout "$MEASURE_TIMEOUT" "$OCEFF" 10 2>&1 | tail -1); say "   $base"
     say "-- offset ladder"
     local best; best=$(cmd_ladder "$clk" 200 50 450 | tail -1)
@@ -930,15 +1048,15 @@ FAKE
 cmd_recover() {
     need_root "$@"
     say "-- clearing offsets and clock locks"
-    "$NVML" 0 0 >/dev/null 2>&1 && say "   offset reset to 0" || say "   ${c_warn}offset reset REFUSED (card may be wedged)${c_off}"
-    nvidia-smi -rgc >/dev/null 2>&1 && say "   clock lock cleared"
-    nvidia-smi -pl 250 >/dev/null 2>&1 && say "   power limit back to 250 W"
+    nvml 0 0 >/dev/null 2>&1 && say "   offset reset to 0" || say "   ${c_warn}offset reset REFUSED (card may be wedged)${c_off}"
+    smi -rgc >/dev/null 2>&1 && say "   clock lock cleared"
+    smi -pl 250 >/dev/null 2>&1 && say "   power limit back to 250 W"
     disarm
     # "Responds" is not "recovered". Prove a CUDA context can still be created before claiming it:
     # the card can pass every query-based check and refuse every context. See ctx_dead().
     if ! wedged && ! ctx_dead; then
         say "${c_ok}card responds and takes a CUDA context - recovered${c_off}"
-        nvidia-smi --query-gpu=clocks.sm,memory.total --format=csv,noheader
+        smi --query-gpu=clocks.sm,memory.total --format=csv,noheader
         return 0
     fi
     if wedged; then
@@ -982,7 +1100,12 @@ cmd_boot_check() {
     # profile that was in flight during a crash is NOT re-applied (that is the wedge-on-every-boot
     # failure this whole mechanism exists to prevent). The flag is keyed to this boot_id.
     printf '%s\n' "$this_boot" > "$STATE/persist-skip-boot"; sync
-    "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
+    # Revert EVERY present card to stock - a crash on any card must not leave any card overclocked.
+    local _i _n; _n=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+    for _i in $(seq 0 $(( ${_n:-1} - 1 )) 2>/dev/null); do
+        resolve_gpu "$_i"
+        nvml 0 0 >/dev/null 2>&1; smi -rgc >/dev/null 2>&1; smi -pl 250 >/dev/null 2>&1
+    done
     logger -t 170tune "reverted to stock: a tuning run did not check in before the machine went down (see $STATE/last_crash.json)"
     say "reverted to stock. The run that did not check in is recorded in $STATE/last_crash.json"
 }
@@ -995,8 +1118,8 @@ cmd_boot_check() {
 
 hbm_guards_ok() {
     local gen mem
-    gen=$(nvidia-smi --query-gpu=pcie.link.gen.gpucurrent --format=csv,noheader 2>/dev/null | tr -d ' ')
-    mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    gen=$(smi --query-gpu=pcie.link.gen.gpucurrent --format=csv,noheader 2>/dev/null | tr -d ' ')
+    mem=$(smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -oE '[0-9]+' | head -1)
     [ "${gen:-0}" -ge 2 ] 2>/dev/null && [ "${mem:-0}" -ge 40000 ] 2>/dev/null
 }
 hbm_triad_measure() { [ -x "$TRIAD" ] || return 0; timeout "$MEASURE_TIMEOUT" "$TRIAD" 2>/dev/null | grep -oiE 'triad[^0-9]*[0-9.]+' | grep -oE '[0-9.]+' | tail -1; }
@@ -1244,6 +1367,7 @@ _hot_gate_sweeps() {
         local crc; timeout $((GATE_COMPUTE + 120)) "$COMPUTE" "$GATE_COMPUTE" >/dev/null 2>&1; crc=$?
         disarm
         if [ $crc -eq 0 ]; then
+            # shellcheck disable=SC2034  # gate-status global, kept for parity with LAST_GATE_SWEEPS/PEAK_HBM
             LAST_GATE_COMPUTE_OK=1
             say "  compute: ${c_ok}clean${c_off}"
         else
@@ -1261,6 +1385,7 @@ _hot_gate_sweeps() {
         say "  ${c_bad}  this is the wedge query-based checks miss. Do not trust the sweep results above - recover first.${c_off}"
         fails=$((fails + 1))
     else
+        # shellcheck disable=SC2034  # gate-status global, kept for parity with LAST_GATE_SWEEPS/PEAK_HBM
         LAST_GATE_CONTEXT_OK=1
     fi
     LAST_GATE_PEAK_HBM=${tmax:-0}
@@ -1370,7 +1495,7 @@ cmd_hbm_gate() {
     [[ "$sweeps" =~ ^[0-9]+$ ]] && [ "$sweeps" -gt 0 ] || die "invalid sweep count '$sweeps'"
     sweep_fraction_milli=$(fraction_to_milli "${SWEEP_FRAC:-0.95}") || die "invalid SWEEP_FRAC '${SWEEP_FRAC:-0.95}'"
     [ "$sweep_fraction_milli" -ge 950 ] || die "hbm-gate qualification requires SWEEP_FRAC >= 0.95"
-    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"
     [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
     [ -x "$SELFTEST" ] || die "gpu_selftest not found at $SELFTEST"
@@ -1407,7 +1532,7 @@ cmd_hbm_gate() {
 
 cmd_mclk_try() {
     local ndiv=${1:?usage: mclk-try <NDIV>}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     refuse_if_mclk_baked "mclk-try"
     wedged && die "GPU is wedged - run 'recover' first"
     ctx_dead && die "GPU answers but takes no CUDA context - it is unusable. Run: 170tune recover"
@@ -1420,7 +1545,7 @@ cmd_mclk_try() {
 
 cmd_mclk_gate() {
     local ndiv=${1:?usage: mclk-gate <NDIV> [n]} n=${2:-4}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     refuse_if_mclk_baked "mclk-gate"
     wedged && die "GPU is wedged - run 'recover' first"
     ctx_dead && die "GPU answers but takes no CUDA context - it is unusable. Run: 170tune recover"
@@ -1428,7 +1553,7 @@ cmd_mclk_gate() {
     # NOT route through mclk_verify here: its early recal + full nvidia_bench between two recals
     # disturbs the eye. The gate is the proven-clean recipe: set NDIV, soak once, recal the eye
     # ONCE in the hot operating state, then steady back-to-back sweeps (_hot_gate_sweeps).
-    "$NVML" 0 0 >/dev/null 2>&1; nvidia-smi -rgc >/dev/null 2>&1; nvidia-smi -pl 250 >/dev/null 2>&1
+    nvml 0 0 >/dev/null 2>&1; smi -rgc >/dev/null 2>&1; smi -pl 250 >/dev/null 2>&1
     # Loosen the timings BEFORE the NDIV bump. Timings are clock-independent cycle counts and looser is
     # always safe at the lower clock, so the jump to the target NDIV never passes through the bare-hang
     # window (stock timings at a too-high clock hard-hang). Applying the tune AFTER the bump risks that.
@@ -1445,7 +1570,7 @@ cmd_mclk_gate() {
 
 cmd_mclk_ladder() {
     local start=${1:-65} step=${2:-1} max=${3:-80}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"; [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     refuse_if_mclk_baked "mclk-ladder"
     say "mclk ladder NDIV $start..$max step $step (live userspace, hot gate each rung, core pinned stock)"
     mclk_revert  # baseline reference at stock
@@ -1478,7 +1603,7 @@ cmd_mclk_ladder() {
 # full-VRAM sweep) call an NDIV safe. Rows are appended to a per-serial CSV.
 cmd_hbm_matrix() {
     local start=${1:-64} step=${2:-2} max=${3:-78}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"
     [ -x "$HBM_MCLK" ] || die "hbm_mclk not found at $HBM_MCLK"
     [ -x "$MEMPROBE" ] || die "mem_probe not found at $MEMPROBE (run '170tune install')"
     [ -x "$NVBENCH" ]  || die "nvidia_bench not found at $NVBENCH (run '170tune install')"
@@ -1517,17 +1642,17 @@ cmd_hbm_matrix() {
         timeout "$MEASURE_TIMEOUT" "$MEMPROBE" >"$mptmp" 2>/dev/null &
         mppid=$!; local psum=0 pn=0
         while kill -0 "$mppid" 2>/dev/null; do
-            p=$(nvidia-smi    --query-gpu=power.draw         --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            p=$(smi    --query-gpu=power.draw         --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
             case "$p" in ''|*[!0-9.]*) : ;; *) psum=$(awk -v s="$psum" -v x="$p" 'BEGIN{print s+x}'); pn=$((pn+1)) ;; esac
-            memc=$(nvidia-smi --query-gpu=temperature.memory --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-            corec=$(nvidia-smi --query-gpu=temperature.gpu   --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            memc=$(smi --query-gpu=temperature.memory --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+            corec=$(smi --query-gpu=temperature.gpu   --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
             sleep 1
         done
         wait "$mppid" 2>/dev/null
         # MEAN board draw across the read load, not peak - a pure read spikes, and the mean is the
         # representative steady figure, comparable to the sustained-load numbers elsewhere in the docs.
         pw=$(awk -v s="$psum" -v n="$pn" 'BEGIN{ if(n>0) printf "%.1f", s/n; else print "" }')
-        [ -n "$pw" ] || pw=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        [ -n "$pw" ] || pw=$(smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
         mpread=$(grep -oE 'read_bw = [0-9.]+' "$mptmp" | grep -oE '[0-9.]+')
         mplat=$(grep -oE 'dram_latency = [0-9.]+' "$mptmp" | grep -oE '[0-9.]+' | head -1)
         rm -f "$mptmp"
@@ -1580,7 +1705,7 @@ cmd_timings() {
 
 cmd_timings_gate() {
     local f=${1:?usage: timings-gate <FIELD> <cyc> [n]} v=${2:?value} n=${3:-4}
-    is_170hx || die "refusing: GPU 0 is not a 170HX"; [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"; [ -x "$FBPA_REGS" ] || die "fbpa_regs not found at $FBPA_REGS"
     wedged && die "GPU is wedged - run 'recover' first"
     ctx_dead && die "GPU answers but takes no CUDA context - it is unusable. Run: 170tune recover"
     "$FBPA_REGS" set "$f" "$v" || { say "${c_bad}fbpa_regs set $f $v failed${c_off}"; return 1; }
@@ -1698,10 +1823,12 @@ PERSIST_HBM_FORCED=0
 load_persist_config() {
     local file=$1 line key value seen=""
     PERSIST_NDIV=""; PERSIST_OFFSET=""; PERSIST_CLK=""; PERSIST_TIMINGS=""; PERSIST_HBM_FORCED=0
+    PERSIST_OC_SERIAL=""
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%$'\r'}
         case "$line" in ''|'#'*) continue ;; esac
         case "$line" in
+            OC_SERIAL=*)  key=OC_SERIAL;  value=${line#OC_SERIAL=} ;;
             NDIV=*)       key=NDIV;       value=${line#NDIV=} ;;
             OFFSET=*)     key=OFFSET;     value=${line#OFFSET=} ;;
             CLK=*)        key=CLK;        value=${line#CLK=} ;;
@@ -1721,6 +1848,7 @@ load_persist_config() {
             esac
         fi
         case "$key" in
+            OC_SERIAL) PERSIST_OC_SERIAL=$value ;;
             NDIV) PERSIST_NDIV=$value ;;
             OFFSET) PERSIST_OFFSET=$value ;;
             CLK) PERSIST_CLK=$value ;;
@@ -1823,6 +1951,7 @@ cmd_persist() {
               else
                   echo "# 170tune persist profile for $s ($(date -Is)) - only GATED values belong here"
               fi
+              echo "OC_SERIAL=${s}"
               echo "NDIV=${ndiv}"; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS=\"${tim}\""; echo "HBM_FORCED=${hbm_forced}"
               [ -n "$profname" ] && echo "# profile: $profname"
             } > "$PERSIST/$s.conf"
@@ -1867,53 +1996,40 @@ cmd_persist() {
 revert_boot_profile() {
     local reason=${1:-runtime-health-failure} timings=${2:-}
     logger -t 170tune "boot-apply: $reason; reverting to stock"
-    "$NVML" 0 0 >/dev/null 2>&1 || true
-    nvidia-smi -rgc >/dev/null 2>&1 || true
+    nvml 0 0 >/dev/null 2>&1 || true
+    smi -rgc >/dev/null 2>&1 || true
     mclk_revert
     restore_hbm_timings "$timings" || true
     disarm
     return 1
 }
 
-# ExecStart of the persist service. Self-disarming: if a marker from a PRIOR boot
-# survived, the last apply went down with the box - stay STOCK, do not re-apply.
-cmd_boot_apply() {
-    need_root boot-apply
-    local s; s=$(serial)
-    local conf="$PERSIST/$s.conf"
-    [ -f "$conf" ] || { logger -t 170tune "boot-apply: no profile for ${s:-unknown}, staying stock"; exit 0; }
-    # boot-check (runs Before= us) sets this flag, keyed to this boot_id, when it detected a
-    # mid-flight crash and reverted to stock. Honor it: do NOT re-apply the profile that may have
-    # caused the crash. A flag from a prior boot has a different id and is cleared as stale.
-    if [ -f "$STATE/persist-skip-boot" ]; then
-        local sb; sb=$(cat "$STATE/persist-skip-boot" 2>/dev/null)
-        rm -f "$STATE/persist-skip-boot"
-        if [ "$sb" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
-            logger -t 170tune "boot-apply: boot-check flagged a mid-flight crash this boot - staying STOCK (see $STATE/last_crash.json)"
-            exit 0
-        fi
-    fi
-    if [ -f "$STATE/armed.json" ]; then
-        local ab tb; ab=$(grep -oE '"boot_id": "[^"]+"' "$STATE/armed.json" | cut -d'"' -f4); tb=$(cat /proc/sys/kernel/random/boot_id)
-        if [ "$ab" != "$tb" ]; then
-            { echo "{\"skipped\":\"$(date -Is)\",\"note\":\"persist apply was in flight when the box went down; staying stock\",\"armed\":"; cat "$STATE/armed.json"; echo "}"; } > "$STATE/last_crash.json"
-            disarm
-            logger -t 170tune "boot-apply: prior apply did not check in - staying STOCK (see $STATE/last_crash.json)"
-            exit 0
-        fi
-    fi
+# Apply the persisted profile for the CURRENTLY SELECTED card (resolve_gpu already ran for it).
+# Returns 1 on any validation/apply/health failure, having reverted THAT card to stock. Never exits,
+# so one card's failure does not abort the others in the boot loop.
+_boot_apply_one() {
+    local s=$1 conf
+    conf="$PERSIST/$s.conf"
     load_persist_config "$conf" || {
-        logger -t 170tune "boot-apply: malformed persist config; staying stock"
+        logger -t 170tune "boot-apply: malformed persist config for $s; staying stock"
         return 1
     }
+    # The conf is named by serial; its recorded OC_SERIAL must agree with the card we are about to
+    # touch. A mismatch means the file was moved/edited to name another card - refuse, or we would
+    # apply one card's qualified point to a different, unqualified card (the exact cross-card hazard
+    # the per-serial receipts exist to prevent).
+    if [ -n "${PERSIST_OC_SERIAL:-}" ] && [ "$PERSIST_OC_SERIAL" != "$s" ]; then
+        logger -t 170tune "boot-apply: $conf records OC_SERIAL=$PERSIST_OC_SERIAL but is the profile for $s; staying stock for this card"
+        return 1
+    fi
     local NDIV=$PERSIST_NDIV OFFSET=$PERSIST_OFFSET CLK=$PERSIST_CLK
     local TIMINGS=$PERSIST_TIMINGS HBM_FORCED=$PERSIST_HBM_FORCED
     if ! validate_persisted_sm "$OFFSET" "$CLK"; then
-        logger -t 170tune "boot-apply: SM config validation failed; staying stock"
+        logger -t 170tune "boot-apply: SM config validation failed for $s; staying stock"
         return 1
     fi
     if ! validate_persisted_hbm "$NDIV" "$TIMINGS" "$HBM_FORCED"; then
-        logger -t 170tune "boot-apply: HBM receipt validation failed; staying stock"
+        logger -t 170tune "boot-apply: HBM receipt validation failed for $s; staying stock"
         return 1
     fi
     local xids_before xids_after hbm_state=stock
@@ -1922,11 +2038,11 @@ cmd_boot_apply() {
     fi
     xids_before=$(xids || true); xids_before=${xids_before:-0}
     arm "persist-$s" "${NDIV:-0}"
-    logger -t 170tune "boot-apply: applying $s HBM=$hbm_state NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
-    if [ -n "${OFFSET:-}" ] && ! "$NVML" "${OFFSET}" 0 >/dev/null 2>&1; then
+    logger -t 170tune "boot-apply: applying $s (GPU $GPU_IDX) HBM=$hbm_state NDIV=${NDIV:-} offset=${OFFSET:-} clk=${CLK:-} timings=${TIMINGS:-}"
+    if [ -n "${OFFSET:-}" ] && ! nvml "${OFFSET}" 0 >/dev/null 2>&1; then
         revert_boot_profile "SM offset apply failed" "$TIMINGS"; return 1
     fi
-    if [ -n "${CLK:-}" ] && ! nvidia-smi -lgc "210,${CLK}" >/dev/null 2>&1; then
+    if [ -n "${CLK:-}" ] && ! smi -lgc "210,${CLK}" >/dev/null 2>&1; then
         revert_boot_profile "SM clock-lock apply failed" "$TIMINGS"; return 1
     fi
     if [ -n "$TIMINGS" ] && ! apply_hbm_timings "$TIMINGS"; then
@@ -1952,6 +2068,47 @@ cmd_boot_apply() {
     fi
     disarm
     logger -t 170tune "boot-apply: profile $s applied and healthy (HBM=$hbm_state)"
+}
+
+# ExecStart of the persist service. Self-disarming: if a marker from a PRIOR boot survived, the last
+# apply went down with the box - stay STOCK, do not re-apply. Then apply EVERY present card's own
+# persisted profile to THAT card (multi-GPU: each card qualifies and persists independently).
+cmd_boot_apply() {
+    need_root boot-apply
+    # boot-check (runs Before= us) sets this flag, keyed to this boot_id, when it detected a
+    # mid-flight crash and reverted to stock. Honor it: do NOT re-apply the profile that may have
+    # caused the crash. A flag from a prior boot has a different id and is cleared as stale. This is
+    # a WHOLE-RUN gate: if any card's apply crashed the box, stay stock for all cards this boot.
+    if [ -f "$STATE/persist-skip-boot" ]; then
+        local sb; sb=$(cat "$STATE/persist-skip-boot" 2>/dev/null)
+        rm -f "$STATE/persist-skip-boot"
+        if [ "$sb" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+            logger -t 170tune "boot-apply: boot-check flagged a mid-flight crash this boot - staying STOCK (see $STATE/last_crash.json)"
+            exit 0
+        fi
+    fi
+    if [ -f "$STATE/armed.json" ]; then
+        local ab tb; ab=$(grep -oE '"boot_id": "[^"]+"' "$STATE/armed.json" | cut -d'"' -f4); tb=$(cat /proc/sys/kernel/random/boot_id)
+        if [ "$ab" != "$tb" ]; then
+            { echo "{\"skipped\":\"$(date -Is)\",\"note\":\"persist apply was in flight when the box went down; staying stock\",\"armed\":"; cat "$STATE/armed.json"; echo "}"; } > "$STATE/last_crash.json"
+            disarm
+            logger -t 170tune "boot-apply: prior apply did not check in - staying STOCK (see $STATE/last_crash.json)"
+            exit 0
+        fi
+    fi
+    local any=0 rc=0 idx cserial
+    while IFS=, read -r idx cserial; do
+        idx=${idx// /}; cserial=${cserial// /}
+        [ -n "$cserial" ] || continue
+        [ -f "$PERSIST/$cserial.conf" ] || continue
+        resolve_gpu "$idx"
+        any=1
+        # Each card is armed/applied/disarmed in turn; a failure reverts THAT card (leaving it stock)
+        # and moves on, but the service exit status reflects any rejection so systemd surfaces it.
+        _boot_apply_one "$cserial" || rc=1
+    done < <(nvidia-smi --query-gpu=index,serial --format=csv,noheader 2>/dev/null)
+    [ "$any" = 1 ] || logger -t 170tune "boot-apply: no persisted profile for any present card, staying stock"
+    exit "$rc"
 }
 
 # --------------------------------------------------------------- migration (HARDWARE-TEST-GATED)
@@ -1986,6 +2143,7 @@ migrate_old_persist() {
     fi
     mkdir -p "$PERSIST"
     { echo "# 170tune persist profile for $s ($(date -Is)) - migrated from $old_conf"
+      echo "OC_SERIAL=${s}"
       echo "NDIV="; echo "OFFSET=${off}"; echo "CLK=${clk}"; echo "TIMINGS="
       [ -n "${prof:-}" ] && echo "# profile: ${prof}"
     } > "$PERSIST/$s.conf"
@@ -2160,14 +2318,14 @@ cmd_preflight() {
     say "${c_hi}170tune preflight${c_off}"
 
     if is_170hx; then
-        say "${c_ok}[ok]${c_off}   GPU 0 is a CMP 170HX (device id $(devid))"
+        say "${c_ok}[ok]${c_off}   GPU $GPU_IDX is a CMP 170HX (device id $(devid))"
     else
-        say "${c_bad}[FAIL]${c_off} GPU 0 is a CMP 170HX"
-        say "       GPU 0 device id $(devid) is not a 170HX"
+        say "${c_bad}[FAIL]${c_off} GPU $GPU_IDX is a CMP 170HX"
+        say "       GPU $GPU_IDX device id $(devid) is not a 170HX"
         hard_fail=1
     fi
 
-    if nvidia-smi >/dev/null 2>&1; then
+    if smi >/dev/null 2>&1; then
         say "${c_ok}[ok]${c_off}   nvidia driver responds"
     else
         say "${c_bad}[FAIL]${c_off} nvidia driver responds"
@@ -2312,7 +2470,19 @@ cat <<'EOF'
 170tune - measure, qualify and recover clock/voltage settings on a CMP 170HX
 
 USAGE
-  170tune <command> [args]
+  170tune [-i N | --gpu N] <command> [args]
+
+MULTI-GPU
+  On a box with more than one 170HX, '-i N' / '--gpu N' (or GPU=N in the environment) selects which
+  card every command acts on. Default 0. Qualification is PER-CARD: a gate receipt, a persisted
+  profile and a quarantine are all keyed to the card's serial, because a point that soaks clean on
+  one card says nothing about another. So tune each card under its own '-i':
+    170tune -i 0 qualify 1350   ;   170tune -i 1 qualify 1350
+    170tune -i 1 persist save --profile eff   ;   170tune -i 1 persist enable
+  'persist enable' installs one shared boot service (run it once under any card that has a saved
+  profile); at boot it applies EACH present card's own persisted profile to THAT card. 'apply'/'reset'
+  act only on the selected card (they stamp OC_SERIAL so the applier never touches a card the profile
+  was not qualified for).
 
 COMMANDS
   explain                     the SM clock/voltage levers, the two regimes, failure modes. Start here.
@@ -2478,18 +2648,17 @@ TYPICAL SESSION (new card/box)
 EOF
 }
 
-# ---- per-card stock override --------------------------------------------------------------
-# 'snapshot-stock' (above) writes a live-read snapshot per serial. Load it here, over the
-# hardcoded STOCK_* defaults near the top of this file, so a card whose real stock differs
-# from the one those defaults were measured on gets its OWN revert target. No card present, or
-# no snapshot taken yet -> serial is empty or the file is missing -> the hardcoded defaults
-# stand, unchanged. Must not error on a box with no card.
-_stock_serial=$(serial 2>/dev/null)
-if [ -n "$_stock_serial" ] && [ -f "$STATE/stock/$_stock_serial.conf" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE/stock/$_stock_serial.conf"
-fi
-unset _stock_serial
+# ---- global GPU selector -----------------------------------------------------------------
+# A leading '-i N' / '--gpu N' (or GPU=N env) selects the card BEFORE the subcommand. Resolve it
+# once here so every helper below - including the stock-override read - targets that card. On the
+# sudo -E re-exec the child re-enters here and re-resolves from the preserved GPU env.
+while [ $# -gt 0 ]; do case "$1" in
+    -i|--gpu) [ $# -ge 2 ] || { echo "-i/--gpu needs a GPU index" >&2; exit 2; }; GPU=$2; shift 2 ;;
+    -i*)      GPU=${1#-i}; shift ;;
+    --gpu=*)  GPU=${1#--gpu=}; shift ;;
+    *) break ;;
+esac; done
+resolve_gpu "${GPU:-0}"   # also loads the selected card's per-serial stock-override revert target
 
 case "${1:-}" in
     -h|--help|help) cmd_help ;;
@@ -2500,8 +2669,10 @@ case "${1:-}" in
     gate)       shift; need_root gate "$@"; cmd_gate "$@" ;;
     ladder)     shift; need_root ladder "$@"; cmd_ladder "$@" ;;
     qualify)    shift; need_root qualify "$@"; cmd_qualify "$@" ;;
-    apply)      shift; need_root apply "$@"; exec "$OCAPPLY" "${1:?profile}" ;;
-    reset)      need_root reset; exec "$OCAPPLY" stock ;;
+    # Scope the hand-off to the SELECTED card: 170hx-oc applies a profile only to the card whose
+    # serial matches OC_SERIAL, so on a multi-card box 'apply'/'reset' touch just this one (default 0).
+    apply)      shift; need_root apply "$@"; OC_SERIAL="$(serial)"; export OC_SERIAL; exec "$OCAPPLY" "${1:?profile}" ;;
+    reset)      shift; need_root reset "$@"; OC_SERIAL="$(serial)"; export OC_SERIAL; exec "$OCAPPLY" stock ;;
     quarantine)   shift; cmd_quarantine "$@" ;;
     unquarantine) shift; cmd_unquarantine "$@" ;;
     selftest)   shift; need_root selftest "$@"; cmd_selftest "$@" ;;
