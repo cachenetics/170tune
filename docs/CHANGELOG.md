@@ -8,7 +8,8 @@ gets walked twice.
 ## 2026-08-30: documentation consolidation
 
 - All measured tables moved to a single home, `docs/reference-matrices.md`;
-  `docs/measurement-matrix.md` is merged into it and removed.
+  `docs/measurement-matrix.md` and `docs/hbm-matrix.md` are merged into it (and into
+  `docs/hbm-timing-understanding.md`) and removed.
 - `docs/hbm-timing-understanding.md` rewritten ground-up as a teaching document; the lab
   chronology and in-line retractions it carried moved here.
 - The FWSEC BAR0 aperture notes (Gen3 link-training background, unrelated to tuning)
