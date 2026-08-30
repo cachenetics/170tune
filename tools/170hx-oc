@@ -21,12 +21,18 @@
 # full-VRAM pattern sweep with mem_errors=0 at least twice):
 #   profile    offset  clk max   bf16 TFLOPS   watts   GFLOPS/W   vs stock
 #   stock        +0    (none)       184.3      199.2      925      -
-#   dense       +250    1200        160.8      120.2     1337     -13% perf, -40% power
-#   eff         +300    1350        180.8      131.2     1378      -2% perf, -34% power  (DEFAULT)
-#   match       +250    1400        186.5      142.2     1311      stock perf, -29% power
-#   balanced    +300    1470        196.2      149.7     1311      +6% perf, -25% power
-#   perf        +350    1590        212.2      181.2     1171     +15% perf, -9% power
-#   max         +350    1650        215.3      186.1     1157     +17% perf at stock power
+#   dense       +250    1200        160.8      120.2     1337     -13% perf, -40% power  (serving-qualified)
+#   eff         +300    1350        180.8      131.2     1378      -2% perf, -34% power  (BENCH-ONLY)
+#   match       +250    1400        186.5      142.2     1311      stock perf, -29% power (DEFAULT, serving-qualified)
+#   balanced    +300    1470        196.2      149.7     1311      +6% perf, -25% power  (BENCH-ONLY)
+#   perf        +350    1590        212.2      181.2     1171     +15% perf, -9% power  (BENCH-ONLY)
+#   max         +350    1650        215.3      186.1     1157     +17% perf at stock power (BENCH-ONLY)
+#
+# SERVING vs BENCH. The +300 and +350 offsets (eff, balanced, perf, max) pass the full-VRAM pattern
+# sweep and a cool GEMM, then FAULT under a sustained real-serving soak (Xid 13 on the weak SMs at
+# GPC3/TPC6). They are BENCH points for synthetic, memory-bound work, not serving points. The
+# serving-qualified offsets on this card are +200 and +250; the no-argument default is 'match'
+# (+250/1400). See docs/reference-matrices.md (serving qualification matrix). When in doubt, +250.
 #
 # THE VOLTAGE FLOOR, AND WHICH END OF IT TO SHIP. The safe offset is a function of the clock: at
 # 1400 the cliff is +325, but at 1350 the rail bottoms out and power goes FLAT long before anything
@@ -39,21 +45,23 @@
 # of margin, and passed a 4-sweep gate clean. Two clean sweeps is NOT a gate for an intermittent
 # fault mode - use four, and prefer margin over a number that looks equal on paper.
 #
-# LIMITS (measured - do not exceed): +350 is the highest offset validated clean, and only at the
+# LIMITS (measured - do not exceed): +350 is the highest offset validated clean under the pattern
+# gate and GEMM (it still faults under a serving soak - see SERVING vs BENCH above), and only at the
 # high-clock profiles where RM picks a higher voltage; +375 faults at 1400 and +450 hard-crashes the
 # GPU ("GPU requires reset", wants a power cycle). Clock ceilings above 1650 buy nothing: 1700 and
 # 1740 both deliver ~1600 MHz, so 1604-1614 is the silicon ceiling at +350.
 # Memory offsets are refused by the driver on this part (allowed range [0..0]) - there is none to set.
 set -uo pipefail
 
-USAGE="usage: $0 [stock|dense|eff|match|balanced|perf|max]
+USAGE="usage: $0 [stock|dense|eff|match|balanced|perf|max]   (default: match)
+       serving-qualified: dense match (+250);  BENCH-ONLY: eff balanced perf max (+300/+350)
        $0 custom <offset> <ceiling>      (or set OC_OFFSET/OC_CLK in the environment)
        $0 --print <profile>              print 'OFFSET CLK PL' and exit, apply nothing"
 
 PRINT=0
 if [ "${1:-}" = "--print" ]; then PRINT=1; shift; fi
 
-PROFILE="${1:-eff}"
+PROFILE="${1:-match}"
 case "$PROFILE" in
   stock)    OFFSET=0   ; CLK=""     ; PL=250 ;;
   dense)    OFFSET=250 ; CLK=1200   ; PL=300 ;;
