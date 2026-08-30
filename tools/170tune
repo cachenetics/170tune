@@ -2380,14 +2380,30 @@ cmd_preflight() {
         # FBPA privilege masks (the cmpunlocker unlock target). Mirrors hbm_mclk.c's own guard:
         # PLM_WRITE_L0 = bit 0x10 means host (level-0) writes are enabled; some cards read back
         # all-ones (0xFFFFFFFF) instead, also open. Anything else means writes get silently dropped.
-        local p1 p2 open1=0 open2=0
+        local p1 p2 open1=0 open2=0 pri1=0 pri2=0
         p1=$("$FBPA_REGS" read 0x00903C7C 2>/dev/null | awk '{print $NF}')
         p2=$("$FBPA_REGS" read 0x009A0168 2>/dev/null | awk '{print $NF}')
-        case "$p1" in 0xFFFFFFFF|0xffffffff) open1=1 ;; 0x*|[0-9]*) [ "$(( p1 & 0x10 ))" -ne 0 ] 2>/dev/null && open1=1 ;; esac
-        case "$p2" in 0xFFFFFFFF|0xffffffff) open2=1 ;; 0x*|[0-9]*) [ "$(( p2 & 0x10 ))" -ne 0 ] 2>/dev/null && open2=1 ;; esac
+        # A read of 0xBADFxxxx (v & 0xFFF00000 == 0xBAD00000) is an NVIDIA PRI (privileged
+        # register interface) error sentinel, NOT a mask value: the register window did not
+        # decode / is fenced. It happens to have bit 0x10 set, so it MUST be caught before the
+        # host-write-bit test below or it reads as a false "open". Seen when an unlock opens the
+        # broadcast FBPA_PLL PLM (0x009a3c7c) but not the unicast FBPA0 PLL (0x00903c7c) that
+        # hbm_mclk get/set drives - e.g. asm64's cmpunlocker. hbm_mclk cannot read/write NDIV
+        # in that state; 170tune's userspace ladder needs the unicast PLL window open.
+        case "$p1" in 0x*|[0-9]*) [ "$(( (p1 & 0xFFF00000) == 0xBAD00000 ))" -eq 1 ] 2>/dev/null && pri1=1 ;; esac
+        case "$p2" in 0x*|[0-9]*) [ "$(( (p2 & 0xFFF00000) == 0xBAD00000 ))" -eq 1 ] 2>/dev/null && pri2=1 ;; esac
+        [ "$pri1" -eq 0 ] && case "$p1" in 0xFFFFFFFF|0xffffffff) open1=1 ;; 0x*|[0-9]*) [ "$(( p1 & 0x10 ))" -ne 0 ] 2>/dev/null && open1=1 ;; esac
+        [ "$pri2" -eq 0 ] && case "$p2" in 0xFFFFFFFF|0xffffffff) open2=1 ;; 0x*|[0-9]*) [ "$(( p2 & 0x10 ))" -ne 0 ] 2>/dev/null && open2=1 ;; esac
         if [ -z "$p1" ] || [ -z "$p2" ]; then
             say "${c_warn}[warn]${c_off} FBPA privilege masks (unlock)"
             say "       could not read PLM registers - check BAR0 access above"
+        elif [ "$pri1" -eq 1 ] || [ "$pri2" -eq 1 ]; then
+            say "${c_bad}[FAIL]${c_off} FBPA privilege masks (unlock)"
+            say "       PLL PLM $p1, MEM PLM $p2 - a 0xBADFxxxx value is a PRI error, the register window is fenced, not open."
+            say "       The FBPA0 PLL register window (0x00903c7c/0x00903c98) is not host-accessible: hbm_mclk cannot read or set NDIV."
+            say "       Your unlock does not open the UNICAST FBPA0 PLL PLM that 170tune's userspace tuner needs (asm64's cmpunlocker opens only the broadcast 0x009a3c7c)."
+            say "       Use the cmpunlocker lineage 170tune targets (170tune install), or set mclk via your unlock's own driver bake (--mclk-ndiv=N) and do not use 170tune's live ladder."
+            hard_fail=1
         elif [ "$open1" -eq 1 ] && [ "$open2" -eq 1 ]; then
             say "${c_ok}[ok]${c_off}   FBPA privilege masks open (PLL PLM $p1, MEM PLM $p2)"
         else
