@@ -1275,7 +1275,7 @@ mclk_verify() {
     local ndiv=${1:?ndiv} rc
     "$HBM_MCLK" set "$ndiv"; rc=$?
     case $rc in
-        0) "$HBM_MCLK" ddll >/dev/null 2>&1 ;;  # recal the PHY data eye at the live clock (lifts 70->75)
+        0) "$HBM_MCLK" ddll >/dev/null 2>&1 ;;  # recal the PHY data eye at the live clock (opt-in; non-deterministic, not a reliable ceiling lever)
         2) say "${c_bad}PLM closed - the unlock is not applied; a host NDIV write is dropped${c_off}"; return 1 ;;
         3) say "${c_bad}PLL did not lock at NDIV $ndiv (COEFF restored to stock)${c_off}"; return 1 ;;
         *) say "${c_bad}hbm_mclk failed (rc=$rc)${c_off}"; return 1 ;;
@@ -1907,7 +1907,7 @@ validate_persisted_hbm() {
 # HARDWARE-TEST-GATED SECTION (persist unification). cmd_persist is the single unified
 # persistence command for BOTH the SM point (offset/clk) and the HBM point (NDIV/timings) - one
 # conf per serial under $PERSIST, one systemd unit (170tune-persist.service via boot-apply below)
-# that re-applies whatever is in it. Named SM profiles are pure sugar over this: '--profile eff'
+# that re-applies whatever is in it. Named SM profiles are pure sugar over this: '--profile match'
 # resolves to a concrete offset/ceiling via profile_point() at SAVE time and is recorded as a
 # comment for humans, never re-resolved at boot (boot-apply only ever reads raw numbers).
 cmd_persist() {
@@ -2478,7 +2478,7 @@ MULTI-GPU
   profile and a quarantine are all keyed to the card's serial, because a point that soaks clean on
   one card says nothing about another. So tune each card under its own '-i':
     170tune -i 0 qualify 1350   ;   170tune -i 1 qualify 1350
-    170tune -i 1 persist save --profile eff   ;   170tune -i 1 persist enable
+    170tune -i 1 persist save --profile match   ;   170tune -i 1 persist enable
   'persist enable' installs one shared boot service (run it once under any card that has a saved
   profile); at boot it applies EACH present card's own persisted profile to THAT card. 'apply'/'reset'
   act only on the selected card (they stamp OC_SERIAL so the applier never touches a card the profile
@@ -2579,7 +2579,7 @@ HBM MEMORY LEVERS (live userspace BAR0 - no driver rebuild; the unlock opens the
 PERSISTENCE (one unified conf per serial + one systemd unit; boot-apply is the single applier)
   persist save [--profile NAME] [--offset O --clk C] [--ndiv N] [--timings "F v ..."] [-f|--force]
                               record the per-serial profile that boot-apply will re-apply. A
-                              named SM profile is sugar: --profile eff resolves to its concrete
+                              named SM profile is sugar: --profile match resolves to its concrete
                               offset/ceiling right here (via 170hx-oc --print) and is written
                               as a comment for humans; boot-apply itself only ever reads raw
                               numbers. An SM point (--offset/--clk, or one resolved from
