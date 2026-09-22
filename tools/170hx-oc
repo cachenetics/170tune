@@ -123,8 +123,11 @@ while IFS=, read -r idx devid serial; do
   fi
   nvidia-smi -i "$idx" -pl "$PL" >/dev/null 2>&1 \
     || echo "170hx-oc: GPU $idx power limit $PL W REFUSED"
-  /usr/local/bin/nvml_oc "$OFFSET" 0 "$idx" >/dev/null 2>&1 \
-    || echo "170hx-oc: GPU $idx offset $OFFSET REFUSED"
+  # nvml_oc always exits 0 here even when the driver silently drops the write (NVML reports
+  # Success on a write it does not apply - see nvml_oc.c's own readback WARNING, which this
+  # redirects to /dev/null). So the offset REFUSED case can ONLY be caught by readback below,
+  # never by this call's exit code - do not add a `|| echo REFUSED` on this line, it is dead code.
+  /usr/local/bin/nvml_oc "$OFFSET" 0 "$idx" >/dev/null 2>&1
   if [ -n "$CLK" ]; then
     nvidia-smi -i "$idx" -lgc "210,$CLK" >/dev/null 2>&1 \
       || echo "170hx-oc: GPU $idx clock ceiling $CLK REFUSED"
@@ -135,6 +138,11 @@ while IFS=, read -r idx devid serial; do
   # configured, which on a two-card box describes the wrong GPU.
   got=$(/usr/local/bin/nvml_oc -i "$idx" 2>/dev/null | awk '/current offset/{print $NF=="MHz" ? $(NF-1) : $NF; exit}')
   lim=$(nvidia-smi -i "$idx" --query-gpu=power.limit --format=csv,noheader 2>/dev/null)
+  # nvml_oc prints the readback signed (%+d, e.g. "+250"); $OFFSET never carries a sign (custom's
+  # arg validation rejects anything but digits) - strip the sign before comparing, not = directly.
+  if [ -z "${got:-}" ] || [ "${got#+}" != "$OFFSET" ]; then
+    echo "170hx-oc: GPU $idx offset $OFFSET REFUSED (readback: ${got:-unknown} - the driver reported the write as applied but did not actually move it; a lower-than-reference power limit is a likely cause)"
+  fi
   echo "170hx-oc: GPU $idx ($serial) profile=$PROFILE offset=${got:-?} clk_max=${CLK:-unlocked} power_limit=${lim:-?}"
   applied=$((applied + 1))
 done < <(nvidia-smi --query-gpu=index,pci.device_id,serial --format=csv,noheader 2>/dev/null)

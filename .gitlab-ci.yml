@@ -29,6 +29,7 @@ lint:
     - shellcheck -S warning $SCRIPTS
     - bash tests/test_170tune.sh
     - bash tests/test_hbm_test_step.sh
+    - bash tests/test_170hx_oc.sh
     - echo "all scripts parse and are shellcheck-clean at warning level"
 
 # --- build: compile every helper from source, exact installer flags, into a throwaway dir ------

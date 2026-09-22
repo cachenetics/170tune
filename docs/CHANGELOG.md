@@ -5,6 +5,32 @@ reference and teaching documents state current truth only; the path that led the
 including the conclusions that turned out to be wrong, is recorded here so no dead end
 gets walked twice.
 
+## 2026-09-22: 170hx-oc silently reported a dropped VF-offset write as applied
+
+- Same live triage as the STOCK_NDIV entry below, next report from the same card: `170hx-oc
+  custom 250 1400` printed `power limit 300 W REFUSED` and `clock ceiling 1400 REFUSED` (both
+  correct - nvidia-smi's own exit code), but no offset warning at all, and the summary line
+  quietly showed `offset=+0` where +250 was requested.
+- Root cause: `nvmlDeviceSetGpcClkVfOffset` can return `NVML_SUCCESS` while the driver drops the
+  write outright - `nvml_oc.c` already detects this via readback and prints an explicit WARNING,
+  but 170hx-oc called it with `>/dev/null 2>&1` and branched on ITS EXIT CODE, which is always 0
+  regardless. The `|| echo "... offset REFUSED"` on that line was dead code - it could not fire.
+  A card whose power limit is well under the 300 W reference (this one reported 150 W) is enough
+  to make the driver refuse the offset outright, silently.
+- Fixed: 170hx-oc already computed the readback one line later (for the summary) - moved the
+  REFUSED check to compare that readback against the requested offset instead of trusting
+  nvml_oc's exit code. Caught one bug while fixing this one: the readback prints signed
+  (`+250`), the requested value never carries a sign, so a naive `=` comparison flagged every
+  SUCCESSFUL apply as refused - fixed by stripping the sign before comparing. Manually verified
+  both directions (dropped and applied) plus a garbled-readback case before trusting it, then
+  added `tests/test_170hx_oc.sh` (stubbed nvidia-smi/nvml_oc, no hardware) so this stays pinned;
+  wired into `.gitlab-ci.yml`'s lint job.
+- 170hx-oc has no OTHER behavioral test coverage - lint (`bash -n` + shellcheck) is all it had
+  before this. Flagging, not fixing further here: the power-limit ceiling itself (150 W on this
+  card vs. the 300 W reference) is very likely a VBIOS power-management-table value, a different
+  axis entirely from what cmpunlocker's driver patches (BAR1/ECC/HBM-PLL) touch - raising it
+  needs a modified VBIOS, not a 170tune change. Out of scope here.
+
 ## 2026-09-22: STOCK_NDIV catch-22 on a non-reference card
 
 - A community 170HX (device id `0x20C2`, 8GB) genuinely stocks at NDIV 54 (1458 MHz), not
