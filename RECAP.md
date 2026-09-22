@@ -1,7 +1,7 @@
 # RECAP - 170tune (proj 63)
 
 updated:  2026-09-22
-branch:   main @ (pending commit)
+branch:   main @ 0779f5b
 state:    clean; landed a fix for a real community-reported catch-22: a card whose own VBIOS stock NDIV differs from 170tune's hardcoded reference (64) was misreported as "driver-baked" with no documented way out, since snapshot-stock (the designed per-card fix) gates on the same check. The STOCK_NDIV env override already existed but was undiscoverable; the three refusal sites (preflight, refuse_if_mclk_baked, snapshot-stock) now name it inline. Two new tests pin the message and the override+persist path (test_170tune.sh); full suite (34 tests) + test_hbm_test_step.sh both green. Found live triaging meatsus (Lab Sus Discord, #clankerchat-general) on a 0x20C2 8GB card stock at NDIV 54/1458MHz.
 next:     publish this fix to the public github.com/cachenetics/170tune mirror (origin/main and github/main share history here, no worktree dance needed - see reference_arieltune_llmtune_public_private_repos for when that WOULD be needed) - gated on operator go per the public-remote push policy; LAN main already has it
 blocked:  github mirror publish, on operator confirmation (routine push gate, not a technical blocker)
