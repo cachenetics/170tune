@@ -1171,7 +1171,7 @@ mclk_source() {
 # Called by snapshot-stock, mclk-try/mclk-gate, and persist save.
 refuse_if_mclk_baked() {
     case "$(mclk_source)" in
-        driver-baked*) die "refusing $1: mclk is $(mclk_source) - rebuild a stock driver; use userspace mclk control" ;;
+        driver-baked*) die "refusing $1: mclk is $(mclk_source) - rebuild a stock driver; use userspace mclk control. If this card's own VBIOS stock genuinely differs from the hardcoded NDIV $STOCK_NDIV reference (nothing baked/tuned it), read the real value with 'hbm_mclk get' and override per-card: STOCK_NDIV=<that value> 170tune $1 (then snapshot-stock to persist it so future runs don't need the env var)." ;;
     esac
 }
 
@@ -2352,6 +2352,9 @@ cmd_preflight() {
             say "       most likely built with cmpunlocker's --mclk-ndiv. snapshot-stock, mclk-try/mclk-gate"
             say "       and persist save all refuse on this driver: rebuild a stock driver and use this"
             say "       tool's userspace mclk control (mclk-try/mclk-gate) instead."
+            say "       If this is genuinely YOUR card's own VBIOS stock (a different reference than the"
+            say "       hardcoded NDIV $STOCK_NDIV this tool assumes, not baked/tuned): read the real value with"
+            say "       'hbm_mclk get', then override per-card with STOCK_NDIV=<that value> before retrying."
             hard_fail=1
             ;;
         unknown) say "${c_warn}[warn]${c_off} memory clock source - could not read nvidia-smi's mclk; skipping the check" ;;
@@ -2466,7 +2469,7 @@ cmd_snapshot_stock() {
     # nvidia-smi reflects it). Capturing that as "stock" would poison the reference every gate and
     # every self-disarm falls back to, so refuse rather than warn. This backstops refuse_if_mclk_baked.
     if [ "${ndiv:-0}" -gt 66 ] 2>/dev/null; then
-        die "refusing snapshot-stock: current NDIV is $ndiv, not stock ($STOCK_NDIV). The card is tuned or the driver is baked with --mclk-ndiv; snapshotting now would poison the stock reference. Revert to stock (170tune reset; rebuild a stock driver if it was baked; reboot), then re-run."
+        die "refusing snapshot-stock: current NDIV is $ndiv, not stock ($STOCK_NDIV). The card is tuned, the driver is baked with --mclk-ndiv, or this card's own VBIOS stock is genuinely $ndiv (a different reference than this tool assumes - if so, override with STOCK_NDIV=$ndiv instead of snapshotting over it). Revert to stock (170tune reset; rebuild a stock driver if it was baked; reboot) or set the override, then re-run."
     fi
 
     mkdir -p "$STATE/stock"

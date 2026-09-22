@@ -269,6 +269,12 @@ The reference numbers transfer as starting points, never as conclusions. On a ne
   what it takes. It does not declare the card recovered until a CUDA context can be
   created on it.
 - `170tune selftest`: proves the detectors themselves still work before you trust a PASS.
+- **`[FAIL] memory clock source (driver-baked, unsupported for tuning)`** on a driver you
+  built with no `--mclk-ndiv`: this tool's stock reference (NDIV 64 / 1728 MHz) was
+  measured on one card; a different VBIOS revision can genuinely stock at a different
+  NDIV. Confirm with `hbm_mclk get`, then override per-card:
+  `STOCK_NDIV=<that value> 170tune snapshot-stock` persists it so nothing after this
+  needs the env var again.
 - The failure ladder, worst first, is in the [README's Safety section](../README.md#safety).
 
 ## 9. Tool inventory

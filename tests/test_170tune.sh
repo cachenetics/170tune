@@ -503,6 +503,40 @@ test_hbm_force_override_is_explicit() {
     printf 'PASS: HBM force override is explicit\n'
 }
 
+test_preflight_hints_stock_ndiv_override_on_nonstock_card() {
+    reset_controls
+    control_set ndiv 54
+    control_set mem_clock 1458
+    set +e
+    output=$(run_tune preflight 2>&1)
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "preflight accepted a non-reference-stock card as stock"
+    assert_contains "$output" "[FAIL] memory clock source"
+    assert_contains "$output" "STOCK_NDIV=<that value>"
+    printf 'PASS: preflight hints the STOCK_NDIV override on a non-reference-stock card\n'
+}
+
+test_stock_ndiv_override_reclassifies_a_genuinely_different_stock_card() {
+    reset_controls
+    rm -rf "$TMP/state/stock"
+    control_set ndiv 54
+    control_set mem_clock 1458
+
+    output=$( STOCK_NDIV=54 run_tune preflight 2>&1 ) || true
+    assert_contains "$output" "[ok]   memory clock source: stock"
+
+    ( STOCK_NDIV=54 run_tune snapshot-stock >/dev/null 2>&1 ) ||
+        fail "snapshot-stock rejected a card at its own live NDIV under the STOCK_NDIV override"
+    assert_file_contains "$TMP/state/stock/TESTSERIAL.conf" "STOCK_NDIV=54"
+
+    output=$(run_tune preflight 2>&1) || true
+    assert_contains "$output" "[ok]   memory clock source: stock"
+
+    rm -rf "$TMP/state/stock"   # this card's snapshot is TEST-SPECIFIC; do not leak stock NDIV=54 into later tests
+    printf 'PASS: STOCK_NDIV override + snapshot-stock persists a non-reference card as its own stock, no env var needed after\n'
+}
+
 test_combined_hbm_gate_writes_exact_receipt() {
     reset_controls
     rm -rf "$TMP/state/gated-hbm"
@@ -981,6 +1015,8 @@ test_hbm_receipt_contents_are_authoritative
 test_hbm_receipt_rejects_missing_required_fields
 test_hbm_receipt_rejects_ambiguous_or_malformed_records
 test_hbm_force_override_is_explicit
+test_preflight_hints_stock_ndiv_override_on_nonstock_card
+test_stock_ndiv_override_reclassifies_a_genuinely_different_stock_card
 test_combined_hbm_gate_writes_exact_receipt
 test_hbm_gate_requires_at_least_95_percent_coverage
 test_combined_hbm_gate_rejects_and_reverts_failures

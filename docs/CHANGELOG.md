@@ -5,6 +5,31 @@ reference and teaching documents state current truth only; the path that led the
 including the conclusions that turned out to be wrong, is recorded here so no dead end
 gets walked twice.
 
+## 2026-09-22: STOCK_NDIV catch-22 on a non-reference card
+
+- A community 170HX (device id `0x20C2`, 8GB) genuinely stocks at NDIV 54 (1458 MHz), not
+  the hardcoded reference NDIV 64 (1728 MHz) `mclk_source()` assumes. Preflight, live off
+  a plain no-`--mclk-ndiv` driver, correctly read NDIV 54 off the register (BAR0, matching
+  nvidia-smi exactly) but misreported it as `driver-baked` - the check has no way to tell
+  "someone baked a custom clock" apart from "this card's own VBIOS stock differs from the
+  one card 170tune was measured on." `snapshot-stock`, the tool's own designed fix for a
+  per-card stock reference, refused for the same reason it exists to fix: it also gates on
+  `mclk_source() != driver-baked`, so a card in this state had no documented way in.
+- The escape hatch already existed (`STOCK_NDIV` env var, read at the top of the script)
+  but was invisible - nothing printed by preflight, `snapshot-stock`, or `explain-hbm`
+  mentioned it, so the only way to find it was to read the shell source directly.
+- Fixed: the three refusal sites (preflight's FAIL block, `refuse_if_mclk_baked`,
+  `snapshot-stock`'s poisoned-reference guard) now name the override inline
+  (`STOCK_NDIV=<value> 170tune snapshot-stock`) and point at `hbm_mclk get` to find the
+  real value. No behavior change for a genuinely driver-baked card - it still refuses the
+  same way, just with a way out documented for the case that isn't that.
+- Not (yet) fixed: 170tune still has exactly one hardcoded reference card. A fleet with
+  multiple stock NDIVs works fine per-card once each has run `snapshot-stock` once, but
+  there is still no way to know a card's true stock NDIV other than reading it live off an
+  unmodified driver - if a user's driver was ALREADY non-stock on first install, the tool
+  cannot tell that apart from a legitimately different-stock card either. Out of scope
+  here; flagging so it isn't rediscovered as a surprise.
+
 ## 2026-08-30: documentation consolidation
 
 - All measured tables moved to a single home, `docs/reference-matrices.md`;
