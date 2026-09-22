@@ -136,6 +136,20 @@ need_root() {
 : "${GPU_IDX:=${GPU:-0}}"
 smi()  { nvidia-smi -i "$GPU_IDX" "$@"; }        # bind every nvidia-smi read/write to the selected card
 nvml() { "$NVML" -i "$GPU_IDX" "$@"; }           # nvml_oc -i <idx> works for both report and set forms
+# The 170HX ships more than one factory-stock point, not just this file's compiled reference:
+# cmpunlocker's overclocking/README.md measured 10GB (0x2082) at NDIV 45/1215MHz, and the 8GB
+# SKU (0x20C2) at EITHER NDIV 54/1458MHz (250W vbios) or NDIV 64/1728MHz (300W vbios, this
+# file's reference) - the two 8GB variants are not distinguishable from the PCI device id alone,
+# so both are listed as legitimate. Anything outside this set for the card's device id is either
+# a genuine bake/tune or an uncatalogued variant - see STOCK_NDIV in refuse_if_mclk_baked.
+known_stock_ndivs() {
+    case "$(devid)" in
+        *20c2*) printf '54 64\n' ;;
+        *2082*) printf '45\n' ;;
+        *) printf '%s\n' "$_STOCK_NDIV_DEF" ;;
+    esac
+}
+
 # Per-card stock revert target: reset to the compiled/env defaults, then source the SELECTED card's
 # snapshot (snapshot-stock writes STOCK_NDIV/STOCK_REFRESH/STOCK_TIMINGS under $STATE/stock/<serial>).
 load_stock_override() {
@@ -144,7 +158,20 @@ load_stock_override() {
     if [ -n "$s" ] && [ -f "$STATE/stock/$s.conf" ]; then
         # shellcheck disable=SC1090
         . "$STATE/stock/$s.conf"
+        return
     fi
+    # No per-card snapshot yet: if the live clock matches one of this device's OTHER documented
+    # stock points, adopt it automatically instead of misclassifying a genuinely-stock card as
+    # driver-baked - the compiled default (STOCK_NDIV 64) is only ONE of at least three real ones.
+    local live_mhz live_ndiv known
+    live_mhz=$(mclk 2>/dev/null)
+    case "${live_mhz:-}" in
+        ''|*[!0-9]*) return ;;   # not a plain number (unreadable) - nothing to infer
+    esac
+    live_ndiv=$((live_mhz / 27))
+    for known in $(known_stock_ndivs); do
+        [ "$live_ndiv" = "$known" ] && { STOCK_NDIV=$live_ndiv; return; }
+    done
 }
 resolve_gpu() {
     GPU_IDX=${1:-0}

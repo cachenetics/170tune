@@ -270,11 +270,12 @@ The reference numbers transfer as starting points, never as conclusions. On a ne
   created on it.
 - `170tune selftest`: proves the detectors themselves still work before you trust a PASS.
 - **`[FAIL] memory clock source (driver-baked, unsupported for tuning)`** on a driver you
-  built with no `--mclk-ndiv`: this tool's stock reference (NDIV 64 / 1728 MHz) was
-  measured on one card; a different VBIOS revision can genuinely stock at a different
-  NDIV. Confirm with `hbm_mclk get`, then override per-card:
-  `STOCK_NDIV=<that value> 170tune snapshot-stock` persists it so nothing after this
-  needs the env var again.
+  built with no `--mclk-ndiv`: the 170HX ships more than one factory-stock point (10GB
+  NDIV 45, 8GB 250W-vbios NDIV 54, 8GB 300W-vbios NDIV 64 - `known_stock_ndivs()`), and
+  170tune auto-detects your card's own live clock against all three, so this should be
+  rare. If you still hit it, your card is at a fourth, uncatalogued clock: confirm with
+  `hbm_mclk get`, then override per-card: `STOCK_NDIV=<that value> 170tune
+  snapshot-stock` persists it so nothing after this needs the env var again.
 - The failure ladder, worst first, is in the [README's Safety section](../README.md#safety).
 
 ## 9. Tool inventory

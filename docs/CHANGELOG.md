@@ -5,6 +5,32 @@ reference and teaching documents state current truth only; the path that led the
 including the conclusions that turned out to be wrong, is recorded here so no dead end
 gets walked twice.
 
+## 2026-09-22: the STOCK_NDIV fix below undersold the problem - now auto-detected
+
+- Follow-up to the STOCK_NDIV entry below, same day: the operator pointed out 170tune
+  officially supports BOTH the 8GB (0x20C2) and 10GB (0x2082) 170HX, which prompted
+  actually checking whether meatsus's NDIV 54 was a one-off VBIOS oddity or something
+  systematic. It is systematic, and already documented in this repo's sibling:
+  cmpunlocker's `overclocking/README.md` measures THREE real stock points, not one -
+  10GB any-wattage at NDIV 45/1215MHz, 8GB 250W-vbios at NDIV 54/1458MHz, 8GB 300W-vbios
+  at NDIV 64/1728MHz (this tool's compiled reference). The two 8GB variants are not
+  distinguishable from the PCI device id alone; the 10GB one is.
+- So the previous fix (name the STOCK_NDIV override at the point of failure) was correct
+  but incomplete: it turned a silent catch-22 into a documented manual step, for a
+  situation that is not an edge case - it is the default experience for every 10GB
+  card and every 250W-vbios 8GB card on first run.
+- Fixed properly: `known_stock_ndivs()` returns the legitimate stock set for the
+  detected device id; `load_stock_override()` now checks the live clock against that
+  set (when no per-card snapshot exists yet) and adopts it automatically, no env var or
+  snapshot-stock run required. The STOCK_NDIV override from the prior entry remains as
+  the fallback for a genuinely fourth/uncatalogued variant - the auto-detect only covers
+  the three documented points, on purpose, so a real bake/tune (or a real unknown) still
+  refuses rather than being silently waved through.
+- Two of the four STOCK_NDIV tests from the prior entry were repointed at an explicitly
+  uncatalogued NDIV (58) so they keep testing the fallback path instead of accidentally
+  testing the now-auto-detected 54 case; two new tests cover the 54 and 45 auto-detect
+  paths directly. 37 tests in test_170tune.sh, all green.
+
 ## 2026-09-22: 170hx-oc silently reported a dropped VF-offset write as applied
 
 - Same live triage as the STOCK_NDIV entry below, next report from the same card: `170hx-oc

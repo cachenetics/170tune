@@ -18,6 +18,12 @@ assert_contains() {
     esac
 }
 
+assert_not_contains() {
+    case "$1" in
+        *"$2"*) fail "did not expect '$2' in: $1" ;;
+    esac
+}
+
 assert_eq() {
     [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
 }
@@ -503,38 +509,64 @@ test_hbm_force_override_is_explicit() {
     printf 'PASS: HBM force override is explicit\n'
 }
 
-test_preflight_hints_stock_ndiv_override_on_nonstock_card() {
+test_preflight_hints_stock_ndiv_override_on_an_uncatalogued_card() {
     reset_controls
-    control_set ndiv 54
-    control_set mem_clock 1458
+    control_set devid 0x20c2   # 8GB SKU, but at an NDIV neither of its two known-stock points (54/64)
+    control_set ndiv 58
+    control_set mem_clock 1566
     set +e
     output=$(run_tune preflight 2>&1)
     rc=$?
     set -e
-    [ "$rc" -ne 0 ] || fail "preflight accepted a non-reference-stock card as stock"
+    [ "$rc" -ne 0 ] || fail "preflight accepted an uncatalogued clock as stock"
     assert_contains "$output" "[FAIL] memory clock source"
     assert_contains "$output" "STOCK_NDIV=<that value>"
-    printf 'PASS: preflight hints the STOCK_NDIV override on a non-reference-stock card\n'
+    printf 'PASS: preflight hints the STOCK_NDIV override on a card matching no known stock point\n'
 }
 
-test_stock_ndiv_override_reclassifies_a_genuinely_different_stock_card() {
+test_stock_ndiv_override_reclassifies_an_uncatalogued_card() {
     reset_controls
     rm -rf "$TMP/state/stock"
-    control_set ndiv 54
-    control_set mem_clock 1458
+    control_set devid 0x20c2
+    control_set ndiv 58
+    control_set mem_clock 1566
 
-    output=$( STOCK_NDIV=54 run_tune preflight 2>&1 ) || true
+    output=$( STOCK_NDIV=58 run_tune preflight 2>&1 ) || true
     assert_contains "$output" "[ok]   memory clock source: stock"
 
-    ( STOCK_NDIV=54 run_tune snapshot-stock >/dev/null 2>&1 ) ||
+    ( STOCK_NDIV=58 run_tune snapshot-stock >/dev/null 2>&1 ) ||
         fail "snapshot-stock rejected a card at its own live NDIV under the STOCK_NDIV override"
-    assert_file_contains "$TMP/state/stock/TESTSERIAL.conf" "STOCK_NDIV=54"
+    assert_file_contains "$TMP/state/stock/TESTSERIAL.conf" "STOCK_NDIV=58"
 
     output=$(run_tune preflight 2>&1) || true
     assert_contains "$output" "[ok]   memory clock source: stock"
 
-    rm -rf "$TMP/state/stock"   # this card's snapshot is TEST-SPECIFIC; do not leak stock NDIV=54 into later tests
-    printf 'PASS: STOCK_NDIV override + snapshot-stock persists a non-reference card as its own stock, no env var needed after\n'
+    rm -rf "$TMP/state/stock"   # this card's snapshot is TEST-SPECIFIC; do not leak stock NDIV=58 into later tests
+    printf 'PASS: STOCK_NDIV override + snapshot-stock persists an uncatalogued card as its own stock, no env var needed after\n'
+}
+
+test_preflight_autodetects_8gb_250w_stock_with_no_override_needed() {
+    reset_controls
+    rm -rf "$TMP/state/stock"
+    control_set devid 0x20c2   # 8GB SKU, 250W vbios variant (cmpunlocker overclocking/README.md)
+    control_set ndiv 54
+    control_set mem_clock 1458
+    output=$(run_tune preflight 2>&1) || true
+    assert_contains "$output" "[ok]   memory clock source: stock"
+    assert_not_contains "$output" "[FAIL] memory clock source"
+    printf 'PASS: an 8GB card at its 250W-vbios stock point (NDIV 54) is recognized with no override\n'
+}
+
+test_preflight_autodetects_10gb_stock_with_no_override_needed() {
+    reset_controls
+    rm -rf "$TMP/state/stock"
+    control_set devid 0x2082   # 10GB SKU (cmpunlocker overclocking/README.md)
+    control_set ndiv 45
+    control_set mem_clock 1215
+    output=$(run_tune preflight 2>&1) || true
+    assert_contains "$output" "[ok]   memory clock source: stock"
+    assert_not_contains "$output" "[FAIL] memory clock source"
+    printf 'PASS: a 10GB card at its own stock point (NDIV 45) is recognized with no override\n'
 }
 
 test_combined_hbm_gate_writes_exact_receipt() {
@@ -1015,8 +1047,10 @@ test_hbm_receipt_contents_are_authoritative
 test_hbm_receipt_rejects_missing_required_fields
 test_hbm_receipt_rejects_ambiguous_or_malformed_records
 test_hbm_force_override_is_explicit
-test_preflight_hints_stock_ndiv_override_on_nonstock_card
-test_stock_ndiv_override_reclassifies_a_genuinely_different_stock_card
+test_preflight_hints_stock_ndiv_override_on_an_uncatalogued_card
+test_stock_ndiv_override_reclassifies_an_uncatalogued_card
+test_preflight_autodetects_8gb_250w_stock_with_no_override_needed
+test_preflight_autodetects_10gb_stock_with_no_override_needed
 test_combined_hbm_gate_writes_exact_receipt
 test_hbm_gate_requires_at_least_95_percent_coverage
 test_combined_hbm_gate_rejects_and_reverts_failures
