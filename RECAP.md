@@ -1,7 +1,7 @@
 # RECAP - 170tune (proj 63)
 
 updated:  2026-09-22
-branch:   main @ (pending commit)
+branch:   main @ 85bdf9d
 state:    clean; landed two fixes from the same live triage (meatsus, Lab Sus Discord #clankerchat-general, 0x20C2 8GB card). (1) STOCK_NDIV catch-22: a card whose own VBIOS stock NDIV (54, measured) differs from the hardcoded reference (64) was misreported as "driver-baked" with no documented way out; the existing-but-undiscoverable STOCK_NDIV env override is now named inline at the three refusal sites. Published to both remotes (LAN 4803c76, github 4803c76 - shared history, plain fast-forward). (2) 170hx-oc reported a driver-dropped VF-offset write as applied: nvml_oc always exits 0 even when NVML's readback shows the write did not take, so the `|| echo REFUSED` on that call was dead code; moved the check to the readback 170hx-oc already computes. Caught a second bug fixing the first: readback is signed ("+250"), the request isn't, so a naive `=` comparison flagged every successful apply as refused - fixed before it shipped. New test_170hx_oc.sh (stubbed, no hardware) pins both directions plus a garbled-readback case; wired into .gitlab-ci.yml. Full suite green: 35 + 3 + 1 tests, shellcheck clean on the full CI script list.
 next:     publish fix (2) to the public github.com/cachenetics/170tune mirror - same shared-history fast-forward as (1), gated on operator go per the public-remote push policy; LAN main will have it once this commit lands
 blocked:  github mirror publish of fix (2), on operator confirmation (routine push gate, not a technical blocker)
