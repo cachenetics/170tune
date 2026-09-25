@@ -41,9 +41,6 @@
 #define PCI_DEVICES "/sys/bus/pci/devices"
 
 /* FBPA PLL registers (from cmpunlocker cmpunlock.c, verified on GA100 170HX). */
-#define REG_PLL_PLM       0x00903c7cU   /* unicast FBPA0 PLL priv-level mask   */
-#define REG_PLL_CFG       0x00903c90U   /* unicast FBPA0 PLL cfg; bit 0x20=lock */
-#define REG_PLL_COEFF     0x00903c98U   /* unicast FBPA0 PLL coeff (read)      */
 #define REG_PLL_COEFF_MC  0x0098bc98U   /* MULTICAST coeff (write all FBPAs)   */
 #define REG_PRI_FENCE     0x001211fcU   /* PRI fence                           */
 
@@ -60,6 +57,7 @@
 #define FBPA_BASE         0x900000U
 #define FBPA_STRIDE       0x4000U
 #define FBPA_CNT          12U
+#define PLL_PLM_OFF       0x3c7cU
 #define PLL_CFG_OFF       0x3c90U
 #define PLL_COEFF_OFF     0x3c98U
 
@@ -82,6 +80,54 @@ static volatile uint32_t *g_bar0;
 static uint32_t rd(uint32_t off) { return g_bar0[off / 4]; }
 static void     wr(uint32_t off, uint32_t v) { g_bar0[off / 4] = v; }
 static uint32_t ndiv_of(uint32_t coeff) { return (coeff >> NDIV_SHIFT) & NDIV_MASK; }
+
+struct fbpa_pll {
+    unsigned index;
+    uint32_t plm_addr, cfg_addr, coeff_addr;
+    uint32_t plm, cfg, coeff;
+};
+
+static int invalid_live_reg(uint32_t v)
+{
+    return v == 0 || IS_PRI_ERROR(v) || IS_ALLONES(v);
+}
+
+/* CMP 170HX cards are floorswept differently. FBPA0 may be disabled even when
+ * another unicast FBPA PLL is live, so discover the first instance whose CFG
+ * and COEFF both decode. A PLM value of 0xffffffff is valid/open and must not
+ * be rejected; only a PRI sentinel makes the PLM read unusable. */
+static int discover_live_fbpa(struct fbpa_pll *out, int verbose)
+{
+    unsigned i;
+
+    for (i = 0; i < FBPA_CNT; i++) {
+        struct fbpa_pll p;
+        uint32_t base = FBPA_BASE + i * FBPA_STRIDE;
+
+        p.index = i;
+        p.plm_addr = base + PLL_PLM_OFF;
+        p.cfg_addr = base + PLL_CFG_OFF;
+        p.coeff_addr = base + PLL_COEFF_OFF;
+        p.plm = rd(p.plm_addr);
+        p.cfg = rd(p.cfg_addr);
+        p.coeff = rd(p.coeff_addr);
+
+        if (IS_PRI_ERROR(p.plm) || invalid_live_reg(p.cfg) || invalid_live_reg(p.coeff)) {
+            if (verbose)
+                fprintf(stderr,
+                        "FBPA%u unusable: PLM 0x%08x CFG 0x%08x COEFF 0x%08x\n",
+                        i, p.plm, p.cfg, p.coeff);
+            continue;
+        }
+
+        *out = p;
+        return 0;
+    }
+
+    if (verbose)
+        fprintf(stderr, "no live/readable FBPA PLL instance found (scanned FBPA0..FBPA11)\n");
+    return -1;
+}
 
 /* ---------------------------------------------------------------- GPU list */
 struct gpu { char bdf[64]; unsigned dev; };
@@ -134,16 +180,15 @@ static void scan_gpus(void)
 
 static int cmd_get(void)
 {
-    uint32_t coeff = rd(REG_PLL_COEFF);
-    uint32_t cfg   = rd(REG_PLL_CFG);
-    uint32_t plm   = rd(REG_PLL_PLM);
-    if (IS_PRI_ERROR(coeff)) {
-        printf("NDIV ? (COEFF PRI error 0x%08x)  PLM 0x%08x\n", coeff, plm);
+    struct fbpa_pll pll;
+
+    if (discover_live_fbpa(&pll, 1) != 0)
         return 3;
-    }
-    printf("NDIV %u  (%u MHz)  COEFF 0x%08x  lock %u  PLM 0x%08x%s\n",
-           ndiv_of(coeff), ndiv_of(coeff) * 27, coeff, (cfg >> 5) & 1U, plm,
-           (plm & PLM_WRITE_L0) ? " (host-write enabled)" : " (host-write BLOCKED - unlock not applied?)");
+
+    printf("NDIV %u  (%u MHz)  COEFF 0x%08x  FBPA %u  lock %u  PLM 0x%08x%s\n",
+           ndiv_of(pll.coeff), ndiv_of(pll.coeff) * 27, pll.coeff, pll.index,
+           (pll.cfg >> 5) & 1U, pll.plm,
+           (pll.plm & PLM_WRITE_L0) ? " (host-write enabled)" : " (host-write BLOCKED - unlock not applied?)");
     return 0;
 }
 
@@ -151,8 +196,8 @@ static int cmd_get(void)
  * and the COEFF restore on lock timeout. */
 static int cmd_set(uint32_t newNdiv)
 {
-    uint32_t plm   = rd(REG_PLL_PLM);
-    uint32_t coeff0 = rd(REG_PLL_COEFF);
+    struct fbpa_pll pll;
+    uint32_t coeff0;
     uint32_t newCoeff, cfg = 0;
     int locked = 0;
     long i;
@@ -161,32 +206,29 @@ static int cmd_set(uint32_t newNdiv)
         fprintf(stderr, "NDIV %u out of range [%u..%u]\n", newNdiv, NDIV_MIN, NDIV_MAX);
         return 1;
     }
+    if (discover_live_fbpa(&pll, 1) != 0)
+        return 3;
+    coeff0 = pll.coeff;
     /* Host (level-0) writes must be enabled, or the multicast write is silently
      * dropped and the clock never moves (looks like a no-op). Guard on the
      * write-level-0 bit, not the whole register (reserved bits vary). */
-    if (!(plm & PLM_WRITE_L0)) {
-        fprintf(stderr, "FBPA_PLL PLM 0x%08x: level-0 (host) write not enabled - unlock did not "
-                        "open it. A host write would be dropped. Aborting.\n", plm);
+    if (!(pll.plm & PLM_WRITE_L0)) {
+        fprintf(stderr, "FBPA%u PLL PLM 0x%08x: level-0 (host) write not enabled - unlock did not "
+                        "open it. A host write would be dropped. Aborting.\n", pll.index, pll.plm);
         return 2;
     }
-    if (coeff0 == 0 || IS_PRI_ERROR(coeff0) || IS_ALLONES(coeff0)) {
-        /* Fall back to the 300W layout (MDIV=1, PDIV=1) if the stock read is bad. */
-        newCoeff = (1U << 16) | (newNdiv << NDIV_SHIFT) | 1U;
-        fprintf(stderr, "warning: stock COEFF read 0x%08x looks bad; using 300W layout\n", coeff0);
-    } else {
-        newCoeff = (coeff0 & ~(NDIV_MASK << NDIV_SHIFT)) | ((newNdiv & NDIV_MASK) << NDIV_SHIFT);
-    }
+    newCoeff = (coeff0 & ~(NDIV_MASK << NDIV_SHIFT)) | ((newNdiv & NDIV_MASK) << NDIV_SHIFT);
 
-    printf("PRE : NDIV %u (COEFF 0x%08x) -> NDIV %u (COEFF 0x%08x)\n",
-           ndiv_of(coeff0), coeff0, newNdiv, newCoeff);
+    printf("PRE : NDIV %u (COEFF 0x%08x) FBPA %u -> NDIV %u (COEFF 0x%08x)\n",
+           ndiv_of(coeff0), coeff0, pll.index, newNdiv, newCoeff);
 
     wr(REG_PLL_COEFF_MC, newCoeff);     /* multicast to every FBPA */
     wr(REG_PRI_FENCE, 0x0U);            /* fence the write */
-    for (i = 0; i < 500; i++) (void)rd(REG_PLL_CFG);   /* settle */
+    for (i = 0; i < 500; i++) (void)rd(pll.cfg_addr);  /* settle */
 
     for (i = 0; i < LOCK_POLL_ITERS; i++) {
-        cfg = rd(REG_PLL_CFG);
-        if (IS_ALLONES(cfg))            /* link error / hammer retrain: NOT a lock */
+        cfg = rd(pll.cfg_addr);
+        if (IS_PRI_ERROR(cfg) || IS_ALLONES(cfg)) /* decode/link error: NOT a lock */
             continue;
         if (cfg & CFG_LOCK) { locked = 1; break; }
     }
@@ -202,10 +244,12 @@ static int cmd_set(uint32_t newNdiv)
     }
 
     {
-        uint32_t coeff1 = rd(REG_PLL_COEFF);
-        printf("POST: NDIV %u (COEFF 0x%08x) lock 1 iter %ld\n", ndiv_of(coeff1), coeff1, i);
-        if (ndiv_of(coeff1) != newNdiv) {
-            fprintf(stderr, "FAIL: COEFF readback NDIV %u != requested %u\n", ndiv_of(coeff1), newNdiv);
+        uint32_t coeff1 = rd(pll.coeff_addr);
+        printf("POST: NDIV %u (COEFF 0x%08x) FBPA %u lock 1 iter %ld\n",
+               ndiv_of(coeff1), coeff1, pll.index, i);
+        if (invalid_live_reg(coeff1) || ndiv_of(coeff1) != newNdiv) {
+            fprintf(stderr, "FAIL: FBPA%u COEFF readback 0x%08x (NDIV %u) != requested %u\n",
+                    pll.index, coeff1, ndiv_of(coeff1), newNdiv);
             return 3;
         }
     }
@@ -234,15 +278,18 @@ static int cmd_ddll(void)
  * self-refresh, so the GPU must be IDLE; volatile, a reboot recovers a hang. */
 static int cmd_set_full(uint32_t newNdiv)
 {
-    uint32_t plm = rd(REG_PLL_PLM);
+    struct fbpa_pll pll;
     uint32_t fbio0, i, poll, fbpaCount = 0, failCount = 0;
 
     if (newNdiv < NDIV_MIN || newNdiv > NDIV_MAX) {
         fprintf(stderr, "NDIV %u out of range [%u..%u]\n", newNdiv, NDIV_MIN, NDIV_MAX);
         return 1;
     }
-    if (!(plm & PLM_WRITE_L0)) {
-        fprintf(stderr, "FBPA_PLL PLM 0x%08x: level-0 write not enabled. Aborting.\n", plm);
+    if (discover_live_fbpa(&pll, 1) != 0)
+        return 3;
+    if (!(pll.plm & PLM_WRITE_L0)) {
+        fprintf(stderr, "FBPA%u PLL PLM 0x%08x: level-0 write not enabled. Aborting.\n",
+                pll.index, pll.plm);
         return 2;
     }
     printf("FULL clock change -> NDIV %u (%u MHz): alert + self-refresh + PLL cycle + DDLL recal\n",
@@ -257,7 +304,7 @@ static int cmd_set_full(uint32_t newNdiv)
         uint32_t base = FBPA_BASE + i * FBPA_STRIDE;
         uint32_t cfgA = base + PLL_CFG_OFF, coA = base + PLL_COEFF_OFF;
         uint32_t oc = rd(cfgA), ocoeff = rd(coA), nc, lock = 0;
-        if (oc == 0 || ocoeff == 0 || IS_PRI_ERROR(oc)) continue;
+        if (invalid_live_reg(oc) || invalid_live_reg(ocoeff)) continue;
         fbpaCount++;
         wr(cfgA, oc & ~0x09U); msleep(2);
         nc = (ocoeff & ~0xFF00U) | ((newNdiv & 0xFFU) << 8);
@@ -282,8 +329,16 @@ static int cmd_set_full(uint32_t newNdiv)
 
     if (fbpaCount == 0) { fprintf(stderr, "no active FBPAs found\n"); return 3; }
     if (failCount > 0) { fprintf(stderr, "%u/%u FBPAs failed to lock\n", failCount, fbpaCount); return 3; }
-    printf("POST: NDIV %u (COEFF 0x%08x) %u FBPAs (%u MHz)\n",
-           ndiv_of(rd(REG_PLL_COEFF)), rd(REG_PLL_COEFF), fbpaCount, newNdiv * 27);
+    {
+        uint32_t coeff = rd(pll.coeff_addr);
+        printf("POST: NDIV %u (COEFF 0x%08x) FBPA %u readback; %u FBPAs (%u MHz)\n",
+               ndiv_of(coeff), coeff, pll.index, fbpaCount, newNdiv * 27);
+        if (invalid_live_reg(coeff) || ndiv_of(coeff) != newNdiv) {
+            fprintf(stderr, "FAIL: FBPA%u COEFF readback 0x%08x (NDIV %u) != requested %u\n",
+                    pll.index, coeff, ndiv_of(coeff), newNdiv);
+            return 3;
+        }
+    }
     return 0;
 }
 
