@@ -87,6 +87,7 @@ combination that fails this way.
 | HBM memory clock | `mclk-try` / `mclk-gate` / `mclk-ladder` / `hbm-matrix` | the FBPA PLL multiplier (NDIV): memory clock = NDIV x 27 MHz |
 | DRAM timings | `timings` / `timings-gate` | the CONFIG timing fields |
 | Refresh interval | `refresh` | the refresh power / heat lever |
+| Idle power | `idle` | an emulated idle state: HBM clock + refresh + SM lock while the card is quiet |
 
 The SM undervolt lowers power at a fixed clock (measured up to -24% at 1350 MHz for the same work).
 The memory clock raises delivered bandwidth. The refresh lever trades retention margin for idle
@@ -136,6 +137,23 @@ qualification. A driver or VBIOS change invalidates the receipt. Recover a misbe
 remotely with `170tune persist disable` or `systemctl mask 170tune-persist.service`; the card boots
 stock either way.
 
+## Idle power
+
+The card has one performance state, so a resident, idle inference server keeps it at ~41 W. `idle`
+gives it an idle state instead - HBM down to 810 MHz and the SM locked low while the card is quiet,
+back on its own profile at the first sign of work - for ~29 W per card, at the cost of ~50-80 ms on
+the first request after an idle period. Opt-in and receipt-gated per card; a card without receipts
+idles its SM only.
+
+```bash
+170tune -i 0 idle gate          # hbm-gate REFRESH 24 at the busy clock and at the idle clock
+170tune idle enable             # every 170HX, each card idles on its own
+170tune idle status
+```
+
+The measurements, the gating model and the safety nets are in
+[`docs/idle-power.md`](docs/idle-power.md).
+
 ## Multiple cards
 
 Every command takes an `-i N` / `--gpu N` selector (or `GPU=N`); the default is index 0 as
@@ -177,6 +195,8 @@ in [`docs/tuning-guide.md`](docs/tuning-guide.md).
 - [`docs/hbm-timing-understanding.md`](docs/hbm-timing-understanding.md) - the memory "why": how HBM
   timing works on this card, the constraint stack, the data-eye and retention ceilings, and the
   refresh triangle.
+- [`docs/idle-power.md`](docs/idle-power.md) - where the idle floor is, and the opt-in emulated
+  idle state that takes a resident card from ~41 W to ~29 W.
 - [`docs/CHANGELOG.md`](docs/CHANGELOG.md) - dated history and the corrections worth keeping visible.
 
 ## License
