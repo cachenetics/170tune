@@ -2407,38 +2407,52 @@ cmd_preflight() {
             say "       cannot mmap BAR0 - add iomem=relaxed to the kernel cmdline (GRUB CMDLINE), update-grub, reboot"
             hard_fail=1
         fi
-        # FBPA privilege masks (the cmpunlocker unlock target). Mirrors hbm_mclk.c's own guard:
-        # PLM_WRITE_L0 = bit 0x10 means host (level-0) writes are enabled; some cards read back
-        # all-ones (0xFFFFFFFF) instead, also open. Anything else means writes get silently dropped.
-        local p1 p2 open1=0 open2=0 pri1=0 pri2=0
-        p1=$("$FBPA_REGS" read 0x00903C7C 2>/dev/null | awk '{print $NF}')
+        # FBPA privilege masks (the cmpunlocker unlock target). CMP 170HX cards can floorsweep
+        # FBPA0, so find the first unicast FBPA whose CFG and COEFF both decode instead of treating
+        # a 0xBADFxxxx read from 0x00903c7c as proof that every PLL instance is fenced. Mirrors
+        # hbm_mclk.c's discovery rule. PLM_WRITE_L0 = bit 0x10 means host writes are enabled;
+        # 0xFFFFFFFF is also a valid/open PLM, but it is invalid for CFG/COEFF readback.
+        local p1="" p2 open1=0 open2=0 pri2=0 pll_fbpa="" pll_cfg="" pll_coeff=""
+        local i base plm_addr cfg_addr coeff_addr p_plm p_cfg p_coeff
+        for i in $(seq 0 11); do
+            base=$((0x900000 + i * 0x4000))
+            printf -v plm_addr '0x%08x' "$((base + 0x3c7c))"
+            printf -v cfg_addr '0x%08x' "$((base + 0x3c90))"
+            printf -v coeff_addr '0x%08x' "$((base + 0x3c98))"
+            p_plm=$("$FBPA_REGS" read "$plm_addr" 2>/dev/null | awk '{print $NF}')
+            p_cfg=$("$FBPA_REGS" read "$cfg_addr" 2>/dev/null | awk '{print $NF}')
+            p_coeff=$("$FBPA_REGS" read "$coeff_addr" 2>/dev/null | awk '{print $NF}')
+            if [[ "$p_plm" =~ ^0[xX][0-9A-Fa-f]+$ &&
+                  "$p_cfg" =~ ^0[xX][0-9A-Fa-f]+$ &&
+                  "$p_coeff" =~ ^0[xX][0-9A-Fa-f]+$ ]] &&
+               (( (p_plm & 0xFFF00000) != 0xBAD00000 &&
+                  p_cfg != 0 && p_cfg != 0xFFFFFFFF && (p_cfg & 0xFFF00000) != 0xBAD00000 &&
+                  p_coeff != 0 && p_coeff != 0xFFFFFFFF && (p_coeff & 0xFFF00000) != 0xBAD00000 )); then
+                pll_fbpa=$i; p1=$p_plm; pll_cfg=$p_cfg; pll_coeff=$p_coeff
+                break
+            fi
+        done
         p2=$("$FBPA_REGS" read 0x009A0168 2>/dev/null | awk '{print $NF}')
-        # A read of 0xBADFxxxx (v & 0xFFF00000 == 0xBAD00000) is an NVIDIA PRI (privileged
-        # register interface) error sentinel, NOT a mask value: the register window did not
-        # decode / is fenced. It happens to have bit 0x10 set, so it MUST be caught before the
-        # host-write-bit test below or it reads as a false "open". Seen when an unlock opens the
-        # broadcast FBPA_PLL PLM (0x009a3c7c) but not the unicast FBPA0 PLL (0x00903c7c) that
-        # hbm_mclk get/set drives - e.g. asm64's cmpunlocker. hbm_mclk cannot read/write NDIV
-        # in that state; 170tune's userspace ladder needs the unicast PLL window open.
-        case "$p1" in 0x*|[0-9]*) [ "$(( (p1 & 0xFFF00000) == 0xBAD00000 ))" -eq 1 ] 2>/dev/null && pri1=1 ;; esac
         case "$p2" in 0x*|[0-9]*) [ "$(( (p2 & 0xFFF00000) == 0xBAD00000 ))" -eq 1 ] 2>/dev/null && pri2=1 ;; esac
-        [ "$pri1" -eq 0 ] && case "$p1" in 0xFFFFFFFF|0xffffffff) open1=1 ;; 0x*|[0-9]*) [ "$(( p1 & 0x10 ))" -ne 0 ] 2>/dev/null && open1=1 ;; esac
+        case "$p1" in 0xFFFFFFFF|0xffffffff) open1=1 ;; 0x*|[0-9]*) [ "$(( p1 & 0x10 ))" -ne 0 ] 2>/dev/null && open1=1 ;; esac
         [ "$pri2" -eq 0 ] && case "$p2" in 0xFFFFFFFF|0xffffffff) open2=1 ;; 0x*|[0-9]*) [ "$(( p2 & 0x10 ))" -ne 0 ] 2>/dev/null && open2=1 ;; esac
-        if [ -z "$p1" ] || [ -z "$p2" ]; then
-            say "${c_warn}[warn]${c_off} FBPA privilege masks (unlock)"
-            say "       could not read PLM registers - check BAR0 access above"
-        elif [ "$pri1" -eq 1 ] || [ "$pri2" -eq 1 ]; then
+        if [ -z "$pll_fbpa" ]; then
             say "${c_bad}[FAIL]${c_off} FBPA privilege masks (unlock)"
-            say "       PLL PLM $p1, MEM PLM $p2 - a 0xBADFxxxx value is a PRI error, the register window is fenced, not open."
-            say "       The FBPA0 PLL register window (0x00903c7c/0x00903c98) is not host-accessible: hbm_mclk cannot read or set NDIV."
-            say "       Your unlock does not open the UNICAST FBPA0 PLL PLM that 170tune's userspace tuner needs (asm64's cmpunlocker opens only the broadcast 0x009a3c7c)."
-            say "       Use the cmpunlocker lineage 170tune targets (170tune install), or set mclk via your unlock's own driver bake (--mclk-ndiv=N) and do not use 170tune's live ladder."
+            say "       no live/readable unicast FBPA PLL found after scanning FBPA0..FBPA11 (PLM/CFG/COEFF)"
+            hard_fail=1
+        elif [ -z "$p2" ]; then
+            say "${c_warn}[warn]${c_off} FBPA privilege masks (unlock)"
+            say "       selected live FBPA$pll_fbpa (CFG $pll_cfg, COEFF $pll_coeff), but could not read MEM PLM - check BAR0 access above"
+        elif [ "$pri2" -eq 1 ]; then
+            say "${c_bad}[FAIL]${c_off} FBPA privilege masks (unlock)"
+            say "       selected live FBPA$pll_fbpa PLL PLM $p1; MEM PLM $p2 is a PRI error, not an open mask"
             hard_fail=1
         elif [ "$open1" -eq 1 ] && [ "$open2" -eq 1 ]; then
-            say "${c_ok}[ok]${c_off}   FBPA privilege masks open (PLL PLM $p1, MEM PLM $p2)"
+            say "${c_ok}[ok]${c_off}   FBPA privilege masks open (live FBPA$pll_fbpa PLL PLM $p1, MEM PLM $p2)"
         else
             say "${c_bad}[FAIL]${c_off} FBPA privilege masks (unlock)"
-            say "       FBPA privilege masks are closed - host register writes will be dropped. Apply the cmpunlocker unlock (patched driver / hammer service) and retry"
+            say "       live FBPA$pll_fbpa: PLL PLM $p1, CFG $pll_cfg, COEFF $pll_coeff; MEM PLM $p2"
+            say "       one or both privilege masks are closed - host register writes will be dropped. Apply the cmpunlocker unlock and retry"
             hard_fail=1
         fi
     fi
