@@ -108,6 +108,7 @@ IDLE_RUN=${IDLE_RUN:-/run/170tune-idle}
 IDLE_UNIT=${IDLE_UNIT:-/etc/systemd/system/170tune-idle.service}
 IDLE_NDIV=${IDLE_NDIV:-30}          # idle HBM clock: 810 MHz, hbm_mclk's floor
 IDLE_REFRESH=${IDLE_REFRESH:-24}    # refresh field while the HBM is cool (the shipped opt-in loosening)
+IDLE_DEEP_REFRESH=${IDLE_DEEP_REFRESH:-48}  # deeper field while the card is also idle, if gated (~0.9 W more)
 IDLE_HOT_BAND=${IDLE_HOT_BAND:-3}   # loosen only this many C below the gated peak; back off at the peak
 IDLE_SWEEPS=${IDLE_SWEEPS:-12}
 # Both shipped 170HX SKUs: 8GB (0x20C2, 64GB unlock) and 10GB (0x2082, 40GB unlock). A 16GB ROM
@@ -2117,9 +2118,18 @@ cmd_idle_gate() {
     for n in "$IDLE_BUSY_NDIV" "$IDLE_NDIV"; do
         cmd_hbm_gate --ndiv "$n" --timings "REFRESH $IDLE_REFRESH" --sweeps "$sweeps" "${extra[@]}" || { rc=1; break; }
     done
+    # The deeper idle-only refresh is a bonus: failing it only keeps the card on REFRESH $IDLE_REFRESH.
+    local deep=0
+    if [ "$rc" -eq 0 ] && [ "$IDLE_DEEP_REFRESH" -gt "$IDLE_REFRESH" ]; then
+        if cmd_hbm_gate --ndiv "$IDLE_NDIV" --timings "REFRESH $IDLE_DEEP_REFRESH" --sweeps "$sweeps" "${extra[@]}"; then
+            deep=1
+        else
+            say "${c_warn}REFRESH $IDLE_DEEP_REFRESH did not hold at the idle clock - $s idles on REFRESH $IDLE_REFRESH${c_off}"
+        fi
+    fi
     idle_restore_busy        # a passing gate leaves its own point applied
     [ "$rc" -eq 0 ] || die "idle gate failed on $s - leave this card SM-only ('idle enable' does that on its own)"
-    say "${c_ok}IDLE GATED: $s may idle its HBM. Turn it on with: 170tune idle enable${c_off}"
+    say "${c_ok}IDLE GATED: $s may idle its HBM$([ "$deep" = 1 ] && echo " (REFRESH $IDLE_DEEP_REFRESH while idle)"). Turn it on with: 170tune idle enable${c_off}"
 }
 
 idle_conf_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
@@ -2150,7 +2160,7 @@ UNIT
 }
 
 cmd_idle_enable() {
-    local group=0 idle_after=5 idx s receipt_busy receipt_idle p1 p2 peak managed=0
+    local group=0 idle_after=5 idx s receipt_busy receipt_idle p1 p2 p3 peak deep managed=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --group) group=1; shift ;;
@@ -2174,8 +2184,13 @@ cmd_idle_enable() {
             receipt_busy=$(hbm_receipt_file "$IDLE_BUSY_NDIV" "REFRESH $IDLE_REFRESH")
             receipt_idle=$(hbm_receipt_file "$IDLE_NDIV" "REFRESH $IDLE_REFRESH")
             p1=$(receipt_number_field "$receipt_busy" peak_hbm_c); p2=$(receipt_number_field "$receipt_idle" peak_hbm_c)
-            peak=$(( p1 < p2 ? p1 : p2 )); hbm=1
-            say "GPU $idx ($s): HBM + SM - idle NDIV $IDLE_NDIV, REFRESH $IDLE_REFRESH at or below $((peak - IDLE_HOT_BAND)) C (gated to $peak C)"
+            peak=$(( p1 < p2 ? p1 : p2 )); hbm=1; deep=$IDLE_REFRESH
+            if [ "$IDLE_DEEP_REFRESH" -gt "$IDLE_REFRESH" ] &&
+               hbm_receipt_gate "$IDLE_NDIV" "REFRESH $IDLE_DEEP_REFRESH" 0 >/dev/null; then
+                p3=$(receipt_number_field "$(hbm_receipt_file "$IDLE_NDIV" "REFRESH $IDLE_DEEP_REFRESH")" peak_hbm_c)
+                peak=$(( p3 < peak ? p3 : peak )); deep=$IDLE_DEEP_REFRESH
+            fi
+            say "GPU $idx ($s): HBM + SM - idle NDIV $IDLE_NDIV, REFRESH $IDLE_REFRESH (busy) / $deep (idle) at or below $((peak - IDLE_HOT_BAND)) C (gated to $peak C)"
         else
             say "GPU $idx ($s): SM-only - no idle-gate receipts for this driver/VBIOS; to idle its HBM too: 170tune -i $idx idle gate"
         fi
@@ -2184,7 +2199,7 @@ cmd_idle_enable() {
           echo "HBM=$hbm"
           echo "BUSY_NDIV=$IDLE_BUSY_NDIV"; echo "BUSY_REFRESH=$IDLE_BUSY_REFRESH"; echo "BUSY_CLK=$IDLE_BUSY_CLK"; echo "IDLE_CLK=210"
           if [ "$hbm" = 1 ]; then
-              echo "IDLE_NDIV=$IDLE_NDIV"; echo "COOL_REFRESH=$IDLE_REFRESH"
+              echo "IDLE_NDIV=$IDLE_NDIV"; echo "COOL_REFRESH=$IDLE_REFRESH"; echo "IDLE_REFRESH=$deep"
               echo "COOL_C=$((peak - IDLE_HOT_BAND))"; echo "HOT_C=$peak"
           fi
         } > "$IDLE_DIR/$s.conf"
@@ -2882,7 +2897,8 @@ PERSISTENCE (one unified conf per serial + one systemd unit; boot-apply is the s
 IDLE POWER (opt-in; the card has one P-state, so this emulates an idle one - see docs/idle-power.md)
   idle gate [--sweeps N] [--workload CMD]
                               per card: hbm-gate REFRESH 24 at the card's busy NDIV and at the idle
-                              NDIV 30. Both receipts let 'idle enable' touch this card's HBM.
+                              NDIV 30. Both receipts let 'idle enable' touch this card's HBM. A third,
+                              optional gate (REFRESH 48 at NDIV 30) earns the deeper idle refresh.
   idle enable [--group] [--idle-after S]
                               write a conf for EVERY 170HX and start 170tune-idle.service. Quiet for
                               S seconds (5): HBM to NDIV 30, SM locked to 210. Any work: back to the

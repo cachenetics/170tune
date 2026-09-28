@@ -26,8 +26,10 @@ clock - not the core, which is why locking clocks low on its own (the usual answ
 single-P-state datacenter cards) buys so little here. A power cap below the VBIOS minimum does
 nothing at idle either: the card is already far below any cap.
 
-Refresh power falls as 1/field: at NDIV 30 and REFRESH 24 about 1.5 W of refresh is left. Going
-further buys under a watt for a rapidly shrinking retention margin, so the idle point stops at 24.
+Refresh power falls as 1/field: at NDIV 30 and REFRESH 24 about 1.5 W of refresh is left. A
+card that also passes a third gate (REFRESH 48 at NDIV 30) idles on 48 and gets most of it back
+(29.33 -> 28.56 W on the reference card); a card that fails it simply idles on 24. Going further
+buys fractions of a watt for a rapidly shrinking retention margin.
 
 With a model resident on two cards (pipeline-parallel, `--group`): **82.5 W -> 59.1 W for the
 pair** (29.6-30.3 W per card). The first request after an idle period pays for the wake-up: time
@@ -38,7 +40,7 @@ to first token went from 48-50 ms to 88-133 ms; decode speed is unchanged.
 | | HBM clock | refresh | SM |
 |---|---|---|---|
 | busy | the card's busy NDIV | busy refresh, or 24 while cool | 210..busy ceiling |
-| idle (quiet for 5 s) | NDIV 30, while cool | busy refresh, or 24 while cool | locked to 210 |
+| idle (quiet for 5 s) | NDIV 30, while cool | busy refresh, or 24 (48 if gated) while cool | locked to 210 |
 
 The busy profile is exactly what `boot-apply` leaves the card on: the persisted NDIV, REFRESH and
 clock ceiling when `170tune-persist` is enabled, else stock with no clock lock. Stopping the
@@ -61,7 +63,8 @@ Two things here can corrupt memory, and neither shows up as a crash:
   to be proven like any other NDIV.
 
 `170tune -i N idle gate` runs `hbm-gate` twice on the card: REFRESH 24 at its busy NDIV and
-REFRESH 24 at NDIV 30 (12 hot sweeps each by default). Both receipts are what lets `idle enable`
+REFRESH 24 at NDIV 30 (12 hot sweeps each by default), then an optional third gate, REFRESH 48 at
+NDIV 30, for the deeper idle-only refresh. Both receipts are what lets `idle enable`
 touch that card's HBM, and it derives the temperature ceiling from them: refresh is loosened and
 the clock dropped only at or below the lower of the two receipts' peak HBM temperature minus 3 C,
 and both back off as soon as the HBM reaches that peak. Like every HBM receipt they are bound to

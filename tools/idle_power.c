@@ -184,7 +184,7 @@ static void apply_hbm(struct card *c)
     if (c->ndiv < 0 || c->refresh < 0) return;      /* not readable (yet): leave HBM alone */
     t = idle_ndiv_target(&c->cfg, c->idle, c->ndiv, c->hbm_c);
     if (t != c->ndiv && !set_ndiv(c, t)) { disarm(c, "PLL did not lock"); return; }
-    t = idle_refresh_target(&c->cfg, c->refresh, c->hbm_c);
+    t = idle_refresh_target(&c->cfg, c->idle, c->refresh, c->hbm_c);
     if (t != c->refresh && !set_refresh(c, t)) disarm(c, "refresh readback mismatch");
 }
 
@@ -335,6 +335,7 @@ static int load_card_cfg(struct card *c, const char *file)
         g->hbm = 0;
         return 1;
     }
+    if (!conf_int(file, "IDLE_REFRESH", &g->idle_refresh)) g->idle_refresh = g->cool_refresh;
     /* The receipts behind HBM=1 are bound to this driver and VBIOS. */
     if (conf_get(file, "DRIVER", want, sizeof(want)) &&
         nvmlSystemGetDriverVersion(have, sizeof(have)) == NVML_SUCCESS && strcmp(want, have) != 0) {
@@ -385,10 +386,10 @@ static void discover(void)
         }
         c->hbm_c = hbm_temp(c);
         c->xids0 = count_xids(c);
-        logf_("%s (%s): managed, %s; busy NDIV %d clk %d, idle NDIV %d clk %d, REFRESH %d<=%dC/%d>=%dC",
+            logf_("%s (%s): managed, %s; busy NDIV %d clk %d, idle NDIV %d clk %d, REFRESH %d busy/%d idle <=%dC, %d >=%dC",
               c->serial, c->bdf, c->cfg.hbm ? "HBM+SM" : "SM-only", c->cfg.busy_ndiv, c->cfg.busy_clk,
               c->cfg.hbm ? c->cfg.idle_ndiv : c->cfg.busy_ndiv, c->cfg.idle_clk,
-              c->cfg.cool_refresh, c->cfg.cool_c, c->cfg.busy_refresh, c->cfg.hot_c);
+              c->cfg.cool_refresh, c->cfg.idle_refresh, c->cfg.cool_c, c->cfg.busy_refresh, c->cfg.hot_c);
         ncards++;
     }
 }

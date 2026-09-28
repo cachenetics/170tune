@@ -19,6 +19,10 @@ gets walked twice.
 - Mutating commands now take their card back from the daemon while they run (`idle_hold`
   in `need_root`), so tuning never has to remember to pause it.
 - Needs the cmpunlocker HBM control PLMs (FBPA_MEM, FBPA PLL) open.
+- Follow-up: an optional third gate (REFRESH 48 at NDIV 30) lets an idle, cool card use the
+  deeper field (-0.8 W measured). Also tested and dropped: HBM at 405 MHz (PDIV 2) halts the PMU
+  (Xid 62); `RMPowerFeature` changes nothing measurable; the FBPA auto self-refresh bit
+  (0x9A02FC bit 0) times GSP out, since GSP-RM runs from HBM.
 
 ## 2026-09-22: the STOCK_NDIV fix below undersold the problem - now auto-detected
 

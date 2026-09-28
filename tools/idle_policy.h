@@ -9,8 +9,9 @@
  *         HBM profile, or stock) and the SM window 210..busy_clk (the persisted ceiling, or no lock)
  *   idle  HBM at idle_ndiv and the SM locked to idle_clk
  *
- * Independently of busy/idle, the refresh interval is loosened to cool_refresh while the HBM is
- * cool and put back to busy_refresh once it is hot. Retention is temperature-dependent and a gate
+ * Independently of busy/idle, the refresh interval is loosened while the HBM is cool - to
+ * cool_refresh, or to the looser idle_refresh while the card is also idle - and put back to
+ * busy_refresh once it is hot. Retention is temperature-dependent and a gate
  * receipt only proves a point up to the HBM temperature it reached, so cool_c is that peak. The
  * idle downclock obeys the same ceiling. hot_c > cool_c is the hysteresis band: between the two,
  * whatever is set stays set.
@@ -21,7 +22,7 @@
 struct idle_cfg {
     int hbm;            /* 1: this card has idle-gate receipts, so HBM may be touched */
     int busy_ndiv, idle_ndiv;
-    int busy_refresh, cool_refresh;
+    int busy_refresh, cool_refresh, idle_refresh;
     int cool_c, hot_c;  /* at or below cool_c: loosen/downclock; at or above hot_c: back off */
     int busy_clk;       /* SM ceiling while busy; 0 = no lock (reset) */
     int idle_clk;
@@ -40,12 +41,16 @@ static inline int idle_ndiv_target(const struct idle_cfg *c, int idle, int cur_n
     return idle_is_cool(c, hbm_c) ? c->idle_ndiv : c->busy_ndiv;
 }
 
-/* Refresh field the card should be at: busy or idle alike, cool_refresh only while cool. */
-static inline int idle_refresh_target(const struct idle_cfg *c, int cur_refresh, int hbm_c)
+/* Refresh field the card should be at: loosened only while cool - idle_refresh when idle,
+ * cool_refresh when busy - and busy_refresh once hot. A card already loosened stays loose
+ * through the hysteresis band; a tight one only loosens once cool. */
+static inline int idle_refresh_target(const struct idle_cfg *c, int idle, int cur_refresh, int hbm_c)
 {
+    int loose = idle ? c->idle_refresh : c->cool_refresh;
     if (!c->hbm) return c->busy_refresh;
-    if (cur_refresh == c->cool_refresh) return idle_is_hot(c, hbm_c) ? c->busy_refresh : c->cool_refresh;
-    return idle_is_cool(c, hbm_c) ? c->cool_refresh : c->busy_refresh;
+    if (cur_refresh == c->cool_refresh || cur_refresh == c->idle_refresh)
+        return idle_is_hot(c, hbm_c) ? c->busy_refresh : loose;
+    return idle_is_cool(c, hbm_c) ? loose : c->busy_refresh;
 }
 
 /* Is there work on the card? Utilization is averaged over up to a second, so an idle card also

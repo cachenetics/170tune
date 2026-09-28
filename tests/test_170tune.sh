@@ -1076,7 +1076,9 @@ test_idle_gate_qualifies_both_clocks_and_hands_the_card_back() {
     output=$(run_tune idle gate --sweeps 4 2>&1) || fail "idle gate failed: $output"
     assert_contains "$output" "HBM PROFILE QUALIFIED: NDIV 64 timings 'REFRESH 24'"
     assert_contains "$output" "HBM PROFILE QUALIFIED: NDIV 30 timings 'REFRESH 24'"
+    assert_contains "$output" "HBM PROFILE QUALIFIED: NDIV 30 timings 'REFRESH 48'"
     assert_contains "$output" "IDLE GATED"
+    assert_contains "$output" "(REFRESH 48 while idle)"
     assert_eq "$(cat "$TMP/control/ndiv")" 64
     assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
     assert_file_contains "$TMP/calls.log" "nvidia-smi -i 0 -rgc"
@@ -1104,6 +1106,7 @@ test_idle_enable_with_receipts_manages_hbm_below_the_gated_peak() {
     assert_file_contains "$conf" "HBM=1"
     assert_file_contains "$conf" "IDLE_NDIV=30"
     assert_file_contains "$conf" "COOL_REFRESH=24"
+    assert_file_contains "$conf" "IDLE_REFRESH=48"
     assert_file_contains "$conf" "HOT_C=65"
     assert_file_contains "$conf" "COOL_C=62"
     assert_file_contains "$conf" "DRIVER=610.43.03"
@@ -1191,6 +1194,17 @@ test_idle_restore_puts_cards_back_on_their_busy_profile() {
     printf 'PASS: idle restore puts cards back on their busy profile\n'
 }
 
+test_idle_without_the_deep_receipt_idles_on_the_cool_refresh() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    IDLE_DEEP_REFRESH=24 run_tune idle gate --sweeps 4 >/dev/null 2>&1 || fail "idle gate failed"
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    conf="$TMP/state/idle/TESTSERIAL.conf"
+    assert_file_contains "$conf" "HBM=1"
+    assert_file_contains "$conf" "IDLE_REFRESH=24"
+    printf 'PASS: without the deep receipt a card idles on the cool refresh\n'
+}
+
 test_path_overrides_isolate_state
 test_hbm_profile_identity_is_canonical
 test_hbm_profile_rejects_malformed_timings
@@ -1237,3 +1251,4 @@ test_idle_follows_the_persisted_profile
 test_idle_refuses_hbm_beside_non_refresh_timings
 test_mutating_commands_take_the_card_back_from_the_daemon
 test_idle_restore_puts_cards_back_on_their_busy_profile
+test_idle_without_the_deep_receipt_idles_on_the_cool_refresh
