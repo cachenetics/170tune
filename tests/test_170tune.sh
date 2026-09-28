@@ -271,6 +271,11 @@ printf '170hx-sweep %s\n' "$*" >> "${TEST_ROOT:?}/calls.log"
 printf 'mem_errors=0 compute_ok=1\n'
 STUB
 
+cat > "$TMP/bin/170hx-oc" <<'STUB'
+#!/usr/bin/env bash
+printf '170hx-oc %s\n' "$*" >> "${TEST_ROOT:?}/calls.log"
+STUB
+
 chmod +x "$TMP/bin/"*
 
 run_tune() {
@@ -281,6 +286,7 @@ run_tune() {
     PERSIST="$TMP/state/persist" \
     PERSIST_UNIT="$TMP/persist.service" \
     NVML="$TMP/bin/nvml_oc" \
+    OCAPPLY="$TMP/bin/170hx-oc" \
     OCEFF="$TMP/bin/oc_eff" \
     BENCH="$TMP/bin/170hx-sweep" \
     COMPUTE="$TMP/bin/compute_check" \
@@ -1038,6 +1044,26 @@ test_multi_gpu_selector_rejects_out_of_range_index() {
     printf 'PASS: the -i selector rejects an out-of-range index\n'
 }
 
+test_apply_custom_forwards_offset_and_ceiling() {
+    reset_controls
+    : > "$TMP/calls.log"
+    run_tune apply custom 250 1400 >/dev/null 2>&1 ||
+        fail "apply custom was rejected"
+    grep -q '^170hx-oc custom 250 1400$' "$TMP/calls.log" ||
+        fail "apply did not forward the offset/ceiling to 170hx-oc (got: $(cat "$TMP/calls.log"))"
+    printf 'PASS: apply custom forwards the offset and ceiling to 170hx-oc\n'
+}
+
+test_apply_named_profile_still_works() {
+    reset_controls
+    : > "$TMP/calls.log"
+    run_tune apply eff >/dev/null 2>&1 ||
+        fail "apply eff was rejected"
+    grep -q '^170hx-oc eff$' "$TMP/calls.log" ||
+        fail "apply did not forward the profile name to 170hx-oc (got: $(cat "$TMP/calls.log"))"
+    printf 'PASS: apply of a named profile still reaches 170hx-oc\n'
+}
+
 test_path_overrides_isolate_state
 test_hbm_profile_identity_is_canonical
 test_hbm_profile_rejects_malformed_timings
@@ -1075,3 +1101,5 @@ test_boot_apply_keeps_old_sm_only_profile_compatible
 test_multi_gpu_boot_apply_targets_only_the_saved_card
 test_multi_gpu_boot_apply_rejects_serial_mismatch
 test_multi_gpu_selector_rejects_out_of_range_index
+test_apply_custom_forwards_offset_and_ceiling
+test_apply_named_profile_still_works
