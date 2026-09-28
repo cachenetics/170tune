@@ -72,6 +72,22 @@ the serial, driver and VBIOS; the daemon re-checks the driver and VBIOS at start
 SM-only if either changed. A card with no receipts still idles its SM - an underclock needs no
 proof.
 
+### The trade-off of the deeper idle refresh
+
+REFRESH 48 at NDIV 30 is a ~61 us interval, about 15x the JEDEC 3.9 us (REFRESH 24 at NDIV 30 is
+~30 us). What it risks is a retention bit flip, and on this card that would be silent: the 170HX
+has no ECC, so there is no Xid and no crash - at idle the resident data is mostly model weights,
+so a flip shows up as slightly worse output until the model is reloaded. What bounds the risk:
+
+- the gate is a real retention test at exactly this point: 12 full-VRAM write-then-read-back
+  sweeps, data resident for tens of seconds between write and read, at 59-67 C;
+- 48 is only used at or below the receipts' peak minus 3 C, i.e. cooler than it was proven;
+- the measured edge is far away: clean out to ~192 us at 64 C, wedged at ~383 us.
+
+What the gate cannot rule out is rare variable-retention events over hours of idle, so the gain
+(~0.8 W per card) is traded for a small, unquantified residual risk. Set `IDLE_DEEP_REFRESH=24`
+before `idle enable` to keep idle cards on REFRESH 24 instead.
+
 The transition itself was tested separately: about 390 live NDIV 30 <-> 64, clock-lock and
 REFRESH 6 <-> 24 flips at 0.1-1.4 s intervals during full-VRAM write/read-back sweeps, on two
 cards: zero memory errors, zero PLL lock failures, zero Xids.
