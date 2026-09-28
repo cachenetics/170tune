@@ -147,7 +147,7 @@ idles its SM only.
 
 ```bash
 170tune -i 0 idle gate          # hbm-gate REFRESH 24 at the busy clock and at the idle clock
-170tune idle enable             # every 170HX; --group to wake/idle cards together
+170tune idle enable             # every 170HX, each card idles on its own
 170tune idle status
 ```
 

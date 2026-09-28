@@ -31,7 +31,7 @@ card that also passes a third gate (REFRESH 48 at NDIV 30) idles on 48 and gets 
 (29.33 -> 28.56 W on the reference card); a card that fails it simply idles on 24. Going further
 buys fractions of a watt for a rapidly shrinking retention margin.
 
-With a model resident on two cards (pipeline-parallel, `--group`): **82.5 W -> 59.1 W for the
+With a model resident on two cards (pipeline-parallel): **82.5 W -> 59.1 W for the
 pair** (29.6-30.3 W per card). The first request after an idle period pays for the wake-up: time
 to first token went from 48-50 ms to 88-133 ms; decode speed is unchanged.
 
@@ -48,9 +48,13 @@ daemon puts every card back on it.
 
 A card is busy the moment NVML reports any SM or memory utilization, or - while idle - its draw
 rises 12 W above the draw it settled at when it went idle (utilization is averaged over up to a
-second; the power sensor reacts in about 20 ms). It goes idle after 5 quiet seconds. By default
-each card moves on its own; `--group` makes them wake and idle together, which is what a model
-split pipeline- or tensor-parallel across cards wants.
+second; the power sensor reacts in about 20 ms). It goes idle after 5 quiet seconds. Each card
+moves on its own, which is also right for a model split pipeline- or tensor-parallel across cards:
+while it serves, every card shows utilization every second and none reaches 5 quiet seconds, and
+at the start of a burst the second card's own wake-up is lost in the first one's (first token from
+idle 88-124 ms independent vs 88-133 ms grouped, two-card pipeline-parallel). `--group` (wake and
+idle together) exists for setups where that does not hold; its cost is that one busy card keeps
+the others awake, e.g. an image job on one card holding an idle inference card at full clocks.
 
 ## Why it is gated, and how
 
