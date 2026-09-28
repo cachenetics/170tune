@@ -5,6 +5,21 @@ reference and teaching documents state current truth only; the path that led the
 including the conclusions that turned out to be wrong, is recorded here so no dead end
 gets walked twice.
 
+## 2026-09-28: an emulated idle state - ~41 W to ~29 W per resident card
+
+- New `idle` command family and `tools/idle_power.c` daemon (docs/idle-power.md). The card
+  has one P-state, so a resident, idle inference server held it at ~41 W. Measured where the
+  floor is: mostly HBM refresh and clock, not the core. Locking the SM low alone is ~2.6 W;
+  REFRESH 24 is ~6 W; NDIV 30 on top ~3 W more.
+- Opt-in and receipt-gated per card: `idle gate` is two `hbm-gate` runs (REFRESH 24 at the
+  busy NDIV and at NDIV 30); `idle enable` touches HBM only with both receipts and takes its
+  temperature ceiling from their peak. Cards without them idle their SM only.
+- The live idle <-> busy transition was tested on its own (~390 flips during full-VRAM
+  write/read-back sweeps, two cards, zero errors), since the gates hold one point still.
+- Mutating commands now take their card back from the daemon while they run (`idle_hold`
+  in `need_root`), so tuning never has to remember to pause it.
+- Needs the cmpunlocker HBM control PLMs (FBPA_MEM, FBPA PLL) open.
+
 ## 2026-09-22: the STOCK_NDIV fix below undersold the problem - now auto-detected
 
 - Follow-up to the STOCK_NDIV entry below, same day: the operator pointed out 170tune

@@ -25,6 +25,7 @@
 #   mclk-try / mclk-gate / mclk-ladder / hbm-matrix / timings / timings-gate / refresh
 #                                   the HBM levers - see 'explain-hbm'
 #   persist save/enable/disable/status   make a gated profile (SM and/or HBM) survive reboots
+#   idle gate/enable/disable/pause/resume/status   opt-in idle power: HBM downclock + SM lock while idle
 #   selftest                       prove the harness still detects a known-bad point
 #   recover                        put the card back, escalating honestly if it is wedged
 #   boot-check                     (systemd) revert if the last run never checked in
@@ -99,6 +100,16 @@ _STOCK_NDIV_DEF=$STOCK_NDIV; _STOCK_REFRESH_DEF=$STOCK_REFRESH; _STOCK_TIMINGS_D
 MCLK_TUNE=${MCLK_TUNE:-}
 PERSIST=${PERSIST:-$STATE/persist}
 PERSIST_UNIT=${PERSIST_UNIT:-/etc/systemd/system/170tune-persist.service}
+# Idle power (opt-in, see 'idle' in --help and docs/idle-power.md): idle_power, run by
+# 170tune-idle.service, gives the cards 'idle enable' wrote a conf for an idle state they lack.
+IDLE_POWER=${IDLE_POWER:-$(find_tool /usr/local/bin/idle_power "$(user_home)/170hx/tools/idle_power" "$HOME/170hx/tools/idle_power")}
+IDLE_DIR=${IDLE_DIR:-$STATE/idle}
+IDLE_RUN=${IDLE_RUN:-/run/170tune-idle}
+IDLE_UNIT=${IDLE_UNIT:-/etc/systemd/system/170tune-idle.service}
+IDLE_NDIV=${IDLE_NDIV:-30}          # idle HBM clock: 810 MHz, hbm_mclk's floor
+IDLE_REFRESH=${IDLE_REFRESH:-24}    # refresh field while the HBM is cool (the shipped opt-in loosening)
+IDLE_HOT_BAND=${IDLE_HOT_BAND:-3}   # loosen only this many C below the gated peak; back off at the peak
+IDLE_SWEEPS=${IDLE_SWEEPS:-12}
 # Both shipped 170HX SKUs: 8GB (0x20C2, 64GB unlock) and 10GB (0x2082, 40GB unlock). A 16GB ROM
 # exists but was never shipped, so it is deliberately not matched here.
 DEVID_170HX_PATTERNS="20c2 2082"
@@ -119,6 +130,31 @@ need_root() {
         local _sn; _sn=$(serial 2>/dev/null)
         printf '170tune: acting on GPU %s%s\n' "$GPU_IDX" "${_sn:+ (serial $_sn)}" >&2
     fi
+    idle_hold "$@"
+}
+
+# A running idle_power owns the managed cards' clocks and HBM. Every mutating command takes its
+# card back for as long as it runs: pause-<serial> makes the daemon put the card on its busy
+# profile and stop touching it, and the EXIT trap hands it back. 'apply'/'reset' exec into
+# 170hx-oc, so no trap survives them; their card stays paused until 'idle resume'.
+idle_hold() {
+    [ -z "${_IDLE_HELD:-}" ] || return 0
+    case "${1:-} ${2:-}" in "idle gate") ;; "idle "*) return 0 ;; esac
+    [ -f "$IDLE_UNIT" ] || return 0
+    systemctl is-active --quiet 170tune-idle.service 2>/dev/null || return 0
+    local s i; s=$(serial 2>/dev/null)
+    [ -n "$s" ] && [ -f "$IDLE_DIR/$s.conf" ] || return 0
+    _IDLE_HELD="$IDLE_RUN/pause-$s"
+    mkdir -p "$IDLE_RUN" && : > "$_IDLE_HELD"
+    case "${1:-}" in
+        apply|reset) say "${c_warn}idle: $s stays out of idle management after '$1' - hand it back with: 170tune idle resume${c_off}" >&2 ;;
+        *) trap 'rm -f "$_IDLE_HELD"' EXIT ;;
+    esac
+    for i in $(seq 1 50); do
+        grep -q "\"serial\": \"$s\", [^}]*\"state\": \"paused\"" "$IDLE_RUN/state.json" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    say "${c_warn}idle: 170tune-idle did not confirm the pause of $s within 5 s${c_off}" >&2
 }
 
 # ---------------------------------------------------------------- GPU selection (issue #4: multi-GPU)
@@ -798,6 +834,10 @@ cmd_status() {
     printf 'offset      : %s MHz\n' "$(cur_offset)"
     smi --query-gpu=clocks.max.sm,clocks.sm,clocks.mem,power.limit,power.draw,temperature.gpu,temperature.memory,memory.total \
         --format=csv 2>/dev/null | sed 's/^/            /'
+    if [ -n "$(serial)" ] && [ -f "$IDLE_DIR/$(serial).conf" ]; then
+        printf 'idle        : %s\n' "$(grep "\"serial\": \"$(serial)\"" "$IDLE_RUN/state.json" 2>/dev/null |
+            sed -E 's/.*"state": "([^"]*)".*"ndiv": (-?[0-9]+).*"refresh": (-?[0-9]+).*/\1 (NDIV \2, REFRESH \3)/' || true)"
+    fi
     if [ -f "$STATE/armed.json" ]; then
         say "${c_warn}armed marker present (a run is in flight or did not check in):${c_off}"
         sed 's/^/            /' "$STATE/armed.json"
@@ -2020,6 +2060,200 @@ cmd_persist() {
     esac
 }
 
+# ---------------------------------------------------------------- idle power (opt-in)
+# A 170HX has one performance state: the driver never lowers the HBM clock and holds the SM at
+# 1140 MHz whenever a CUDA context exists, so a card idles at ~41 W with a model resident. Most of
+# that is the HBM (refresh + clock), not the core. idle_power emulates an idle state instead: while
+# a card is quiet its HBM drops to IDLE_NDIV and its SM is locked low; any activity puts it back on
+# its busy profile at once. Measured ~41 -> ~29 W per card; the first request after an idle period
+# pays ~50-80 ms. The refresh interval is loosened to IDLE_REFRESH only while the HBM is cool.
+#
+# Nothing is touched until 'idle enable'. HBM is touched only on a card with both idle-gate
+# receipts ('idle gate'): REFRESH IDLE_REFRESH at the card's busy NDIV and at IDLE_NDIV, bound to
+# this driver/VBIOS like every HBM receipt. A card without them is managed SM-only (an underclock
+# needs no proof). The cool/hot thresholds come from the receipts' own peak HBM temperature.
+
+# The profile a card runs while busy - exactly what boot-apply leaves it on: the persisted
+# NDIV/REFRESH/CLK when 170tune-persist is enabled, else stock with no clock lock. IDLE_BUSY_OTHER
+# collects persisted timings other than REFRESH, which idling does not combine with.
+idle_busy_profile() {
+    local conf="$PERSIST/${1:?serial}.conf" normalized
+    IDLE_BUSY_NDIV=$STOCK_NDIV; IDLE_BUSY_REFRESH=$STOCK_REFRESH; IDLE_BUSY_CLK=0; IDLE_BUSY_OTHER=""
+    [ -f "$conf" ] || return 0
+    [ "$(systemctl is-enabled 170tune-persist.service 2>/dev/null)" = enabled ] || return 0
+    load_persist_config "$conf" >/dev/null || { say "${c_bad}malformed $conf${c_off}"; return 1; }
+    [ -n "$PERSIST_NDIV" ] && IDLE_BUSY_NDIV=$PERSIST_NDIV
+    [ -n "$PERSIST_CLK" ] && IDLE_BUSY_CLK=$PERSIST_CLK
+    normalized=$(normalize_timings "$PERSIST_TIMINGS") || return 1
+    # shellcheck disable=SC2086
+    set -- $normalized
+    while [ $# -ge 2 ]; do
+        if [ "$1" = REFRESH ]; then IDLE_BUSY_REFRESH=$2; else IDLE_BUSY_OTHER="$IDLE_BUSY_OTHER $1 $2"; fi
+        shift 2
+    done
+}
+
+idle_restore_busy() {
+    "$HBM_MCLK" set "$IDLE_BUSY_NDIV" >/dev/null 2>&1
+    "$FBPA_REGS" set REFRESH "$IDLE_BUSY_REFRESH" >/dev/null 2>&1
+    if [ "$IDLE_BUSY_CLK" -gt 0 ]; then smi -lgc "210,$IDLE_BUSY_CLK" >/dev/null 2>&1; else smi -rgc >/dev/null 2>&1; fi
+}
+
+cmd_idle_gate() {
+    local sweeps=$IDLE_SWEEPS s n rc=0 extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sweeps) sweeps=${2:?--sweeps needs a count}; shift 2 ;;
+            --workload) extra=(--workload "${2:?--workload needs a command}"); shift 2 ;;
+            *) die "unknown idle gate argument '$1'" ;;
+        esac
+    done
+    is_170hx || die "refusing: GPU $GPU_IDX is not a 170HX"
+    s=$(serial)
+    idle_busy_profile "$s" || die "refusing: cannot read the persisted profile of $s"
+    [ -z "$IDLE_BUSY_OTHER" ] ||
+        die "refusing: $s persists timings other than REFRESH (${IDLE_BUSY_OTHER# }); 'idle enable' still idles its SM"
+    say "idle gate on $s: REFRESH $IDLE_REFRESH at the busy clock (NDIV $IDLE_BUSY_NDIV) and the idle clock (NDIV $IDLE_NDIV), $sweeps hot sweeps each"
+    for n in "$IDLE_BUSY_NDIV" "$IDLE_NDIV"; do
+        cmd_hbm_gate --ndiv "$n" --timings "REFRESH $IDLE_REFRESH" --sweeps "$sweeps" "${extra[@]}" || { rc=1; break; }
+    done
+    idle_restore_busy        # a passing gate leaves its own point applied
+    [ "$rc" -eq 0 ] || die "idle gate failed on $s - leave this card SM-only ('idle enable' does that on its own)"
+    say "${c_ok}IDLE GATED: $s may idle its HBM. Turn it on with: 170tune idle enable${c_off}"
+}
+
+idle_conf_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+install_idle_unit() {
+    cat > "$IDLE_UNIT" <<UNIT
+[Unit]
+Description=170tune - idle power for enabled CMP 170HX cards (HBM downclock + SM lock while idle)
+After=nvidia-persistenced.service 170tune-persist.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+Environment=HBM_MCLK=$HBM_MCLK
+Environment=FBPA_REGS=$FBPA_REGS
+Environment=STATE=$STATE
+Environment=IDLE_DIR=$IDLE_DIR
+Environment=RUN_DIR=$IDLE_RUN
+ExecStart=$IDLE_POWER
+# After a crash a card could be left on its idle clocks: put every managed card back on its busy profile.
+ExecStopPost=$SELF idle restore
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+cmd_idle_enable() {
+    local group=0 idle_after=5 idx s receipt_busy receipt_idle p1 p2 peak managed=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --group) group=1; shift ;;
+            --idle-after) idle_after=${2:?--idle-after needs seconds}; shift 2 ;;
+            *) die "unknown idle enable argument '$1'" ;;
+        esac
+    done
+    [[ "$idle_after" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid --idle-after '$idle_after'"
+    [ -x "$IDLE_POWER" ] || die "idle_power not found at $IDLE_POWER - run: 170tune install"
+    mkdir -p "$IDLE_DIR"
+    for idx in $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | grep '^[0-9]'); do
+        resolve_gpu "$idx"
+        is_170hx || continue
+        s=$(serial)
+        idle_busy_profile "$s" || { say "${c_bad}GPU $idx ($s): skipped${c_off}"; continue; }
+        local hbm=0
+        if [ -n "$IDLE_BUSY_OTHER" ]; then
+            say "GPU $idx ($s): SM-only - it persists timings other than REFRESH"
+        elif hbm_receipt_gate "$IDLE_BUSY_NDIV" "REFRESH $IDLE_REFRESH" 0 >/dev/null &&
+             hbm_receipt_gate "$IDLE_NDIV" "REFRESH $IDLE_REFRESH" 0 >/dev/null; then
+            receipt_busy=$(hbm_receipt_file "$IDLE_BUSY_NDIV" "REFRESH $IDLE_REFRESH")
+            receipt_idle=$(hbm_receipt_file "$IDLE_NDIV" "REFRESH $IDLE_REFRESH")
+            p1=$(receipt_number_field "$receipt_busy" peak_hbm_c); p2=$(receipt_number_field "$receipt_idle" peak_hbm_c)
+            peak=$(( p1 < p2 ? p1 : p2 )); hbm=1
+            say "GPU $idx ($s): HBM + SM - idle NDIV $IDLE_NDIV, REFRESH $IDLE_REFRESH at or below $((peak - IDLE_HOT_BAND)) C (gated to $peak C)"
+        else
+            say "GPU $idx ($s): SM-only - no idle-gate receipts for this driver/VBIOS; to idle its HBM too: 170tune -i $idx idle gate"
+        fi
+        { echo "# 170tune idle profile for $s ($(date -Is)) - written by 'idle enable'; HBM=1 only with both idle-gate receipts"
+          echo "SERIAL=$s"; echo "DEVICE_ID=$(devid)"; echo "DRIVER=$(driver_version)"; echo "VBIOS=$(vbios_version)"
+          echo "HBM=$hbm"
+          echo "BUSY_NDIV=$IDLE_BUSY_NDIV"; echo "BUSY_REFRESH=$IDLE_BUSY_REFRESH"; echo "BUSY_CLK=$IDLE_BUSY_CLK"; echo "IDLE_CLK=210"
+          if [ "$hbm" = 1 ]; then
+              echo "IDLE_NDIV=$IDLE_NDIV"; echo "COOL_REFRESH=$IDLE_REFRESH"
+              echo "COOL_C=$((peak - IDLE_HOT_BAND))"; echo "HOT_C=$peak"
+          fi
+        } > "$IDLE_DIR/$s.conf"
+        managed=$((managed + 1))
+    done
+    [ "$managed" -gt 0 ] || die "no 170HX found to manage"
+    { echo "# 170tune idle daemon settings - written by 'idle enable'"
+      echo "GROUP=$group"; echo "IDLE_AFTER=$idle_after"
+    } > "$IDLE_DIR/daemon.conf"
+    install_idle_unit
+    systemctl daemon-reload
+    systemctl enable 170tune-idle.service >/dev/null 2>&1
+    systemctl restart 170tune-idle.service
+    say "${c_ok}170tune-idle.service enabled for $managed card(s)${c_off}$([ "$group" = 1 ] && echo " - cards wake and idle together")"
+    say "  every mutating 170tune command takes its card back while it runs; turn it off with: 170tune idle disable"
+}
+
+# ExecStopPost: put every managed card back on its busy profile, whatever the daemon left it on.
+cmd_idle_restore() {
+    local idx s conf
+    for idx in $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | grep '^[0-9]'); do
+        resolve_gpu "$idx"
+        s=$(serial); conf="$IDLE_DIR/$s.conf"
+        [ -f "$conf" ] || continue
+        IDLE_BUSY_NDIV=$(idle_conf_get "$conf" BUSY_NDIV); IDLE_BUSY_REFRESH=$(idle_conf_get "$conf" BUSY_REFRESH)
+        IDLE_BUSY_CLK=$(idle_conf_get "$conf" BUSY_CLK)
+        [[ "$IDLE_BUSY_NDIV$IDLE_BUSY_REFRESH$IDLE_BUSY_CLK" =~ ^[0-9]+$ ]] || { say "${c_bad}malformed $conf${c_off}"; continue; }
+        if [ "$(idle_conf_get "$conf" HBM)" = 1 ]; then
+            idle_restore_busy
+        elif [ "$IDLE_BUSY_CLK" -gt 0 ]; then
+            smi -lgc "210,$IDLE_BUSY_CLK" >/dev/null 2>&1
+        else
+            smi -rgc >/dev/null 2>&1
+        fi
+        say "$s: back on its busy profile"
+    done
+}
+
+cmd_idle_status() {
+    local f
+    say "170tune-idle.service: $(systemctl is-enabled 170tune-idle.service 2>/dev/null || echo not-installed), $(systemctl is-active 170tune-idle.service 2>/dev/null)"
+    [ -f "$IDLE_RUN/pause" ] && say "${c_warn}paused for every card ($IDLE_RUN/pause) - 170tune idle resume${c_off}"
+    for f in "$IDLE_DIR"/*.conf; do
+        [ -f "$f" ] && [ "$(basename "$f")" != daemon.conf ] || continue
+        say "  $(idle_conf_get "$f" SERIAL): $([ "$(idle_conf_get "$f" HBM)" = 1 ] && echo "HBM + SM" || echo "SM-only")"
+    done
+    [ -f "$IDLE_RUN/state.json" ] && grep '"serial"' "$IDLE_RUN/state.json" |
+        sed -E 's/.*"serial": "([^"]*)".*"state": "([^"]*)".*"ndiv": (-?[0-9]+).*"refresh": (-?[0-9]+).*"hbm_c": (-?[0-9]+).*"power_w": ([0-9.]+).*/  \1 now: \2, NDIV \3, REFRESH \4, HBM \5 C, \6 W/'
+    return 0
+}
+
+cmd_idle() {
+    local sub=${1:-status}; shift 2>/dev/null || true
+    case "$sub" in
+        gate)    need_root idle gate "$@"; cmd_idle_gate "$@" ;;
+        enable)  need_root idle enable "$@"; cmd_idle_enable "$@" ;;
+        disable) need_root idle disable
+                 systemctl disable --now 170tune-idle.service >/dev/null 2>&1
+                 say "170tune-idle.service disabled - cards are back on their busy profiles (confs kept in $IDLE_DIR)" ;;
+        pause)   need_root idle pause; mkdir -p "$IDLE_RUN"; : > "$IDLE_RUN/pause"
+                 say "idle management paused for every card - 170tune idle resume" ;;
+        resume)  need_root idle resume; rm -f "$IDLE_RUN/pause" "$IDLE_RUN"/pause-*
+                 say "idle management resumed" ;;
+        restore) need_root idle restore; cmd_idle_restore ;;
+        status)  cmd_idle_status ;;
+        *) die "usage: idle {gate [--sweeps N] [--workload CMD] | enable [--group] [--idle-after S] | disable | pause | resume | status}" ;;
+    esac
+}
+
 revert_boot_profile() {
     local reason=${1:-runtime-health-failure} timings=${2:-}
     logger -t 170tune "boot-apply: $reason; reverting to stock"
@@ -2265,8 +2499,10 @@ cmd_install() {
     _install_build fbpa_regs gcc "$prefix" "$tmp" "$D/fbpa_regs.c" && ok=$((ok+1)) || fail=$((fail+1))
     if [ -n "$cuda_root" ]; then
         _install_build nvml_oc gcc "$prefix" "$tmp" "$D/nvml_oc.c" "-I$cuda_root/include" -lnvidia-ml && ok=$((ok+1)) || fail=$((fail+1))
+        _install_build idle_power gcc "$prefix" "$tmp" "$D/idle_power.c" "-I$cuda_root/include" -lnvidia-ml && ok=$((ok+1)) || fail=$((fail+1))
     else
         _install_build nvml_oc gcc "$prefix" "$tmp" "$D/nvml_oc.c" -lnvidia-ml && ok=$((ok+1)) || fail=$((fail+1))
+        _install_build idle_power gcc "$prefix" "$tmp" "$D/idle_power.c" -lnvidia-ml && ok=$((ok+1)) || fail=$((fail+1))
     fi
 
     if [ -n "$nvcc_bin" ]; then
@@ -2643,6 +2879,23 @@ PERSISTENCE (one unified conf per serial + one systemd unit; boot-apply is the s
   A box still on the OLD 170hx-oc.service model is migrated automatically the next time you run
   '170tune install' - see SETUP above. There is no manual migration step.
 
+IDLE POWER (opt-in; the card has one P-state, so this emulates an idle one - see docs/idle-power.md)
+  idle gate [--sweeps N] [--workload CMD]
+                              per card: hbm-gate REFRESH 24 at the card's busy NDIV and at the idle
+                              NDIV 30. Both receipts let 'idle enable' touch this card's HBM.
+  idle enable [--group] [--idle-after S]
+                              write a conf for EVERY 170HX and start 170tune-idle.service. Quiet for
+                              S seconds (5): HBM to NDIV 30, SM locked to 210. Any work: back to the
+                              card's busy profile (its persisted point, else stock) at once. Refresh
+                              is loosened only while the HBM is below its gated peak. Cards without
+                              both receipts idle their SM only. --group: cards wake and idle
+                              together (pipeline/tensor parallel across cards).
+  idle disable | pause | resume | status
+                              stop the service (cards back on their busy profile) / hand every card
+                              back until resume / show what each card is doing.
+  Measured ~41 -> ~29 W per card with a model resident; the first request after an idle period pays
+  ~50-80 ms. Every mutating 170tune command takes its card back from the daemon while it runs.
+
 PROFILES (applied by 170hx-oc, which 'apply' calls)
   stock     +0   / no lock    184.3 TF @ 199.2 W    baseline
   dense     +250 / 1200       160.8 TF @ 120.2 W    most cards per PSU
@@ -2737,6 +2990,7 @@ case "${1:-}" in
     timings-stock) shift; need_root timings-stock; hbm_timing_stock; say "restored stock timings" ;;
     hbm-profile)   shift; hbm_timing_profile "${1:?usage: hbm-profile <NDIV>}"; echo ;;
     persist)     shift; cmd_persist "$@" ;;
+    idle)        shift; cmd_idle "$@" ;;
     boot-apply)  shift; cmd_boot_apply "$@" ;;
     install)         shift; need_root install "$@"; cmd_install "$@" ;;
     preflight)        shift; cmd_preflight "$@" ;;

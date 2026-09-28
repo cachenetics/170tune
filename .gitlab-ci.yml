@@ -50,9 +50,12 @@ build:
     - gcc -O2 -o "$out/fbpa_regs" tools/fbpa_regs.c && echo "ok fbpa_regs"
     - g++ -std=c++11 -O2 -Wall -Wextra -pedantic -o "$out/resident_sweep_test" tests/resident_sweep_test.cpp
     - "$out/resident_sweep_test"
+    - gcc -std=c99 -O2 -Wall -Wextra -pedantic -o "$out/idle_policy_test" tests/idle_policy_test.c
+    - "$out/idle_policy_test"
     - |
       if [ -n "$cuda_root" ]; then inc="-I$cuda_root/include"; else inc=""; fi
       gcc -O2 -o "$out/nvml_oc" tools/nvml_oc.c $inc -lnvidia-ml && echo "ok nvml_oc"
+      gcc -O2 -o "$out/idle_power" tools/idle_power.c $inc -lnvidia-ml && echo "ok idle_power"
     - |
       # CUDA helpers are required when nvcc is present (the cache runner has it); if a future
       # runner has no CUDA toolkit this degrades to a loud skip rather than a red pipeline, exactly

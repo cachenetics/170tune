@@ -75,6 +75,7 @@ reset_controls() {
     control_set timing_REFRESH 6
     control_set timing_RAS 43
     control_set systemctl_enabled disabled
+    rm -rf "$TMP/state/idle" "$TMP/run" "$TMP/idle.service"
 }
 
 cat > "$TMP/bin/id" <<'STUB'
@@ -185,6 +186,13 @@ STUB
 cat > "$TMP/bin/nvml_oc" <<'STUB'
 #!/usr/bin/env bash
 printf 'nvml_oc %s\n' "$*" >> "${TEST_ROOT:?}/calls.log"
+# idle hold probe: record whether the card was held while this command touched it
+[ -e "${TEST_ROOT}/run/pause-TESTSERIAL" ] && printf 'nvml_oc saw pause-TESTSERIAL\n' >> "${TEST_ROOT}/calls.log"
+exit 0
+STUB
+
+cat > "$TMP/bin/idle_power" <<'STUB'
+#!/usr/bin/env bash
 exit 0
 STUB
 
@@ -288,6 +296,9 @@ run_tune() {
     HBM_MCLK="$TMP/bin/hbm_mclk" \
     FBPA_REGS="$TMP/bin/fbpa_regs" \
     SELFTEST="$TMP/bin/gpu_selftest" \
+    IDLE_POWER="$TMP/bin/idle_power" \
+    IDLE_UNIT="$TMP/idle.service" \
+    IDLE_RUN="$TMP/run" \
     GATE_TEMP=60 \
     GATE_SOAK_MAX=1 \
     MCLK_GATE_SOAK_MAX=1 \
@@ -1038,6 +1049,148 @@ test_multi_gpu_selector_rejects_out_of_range_index() {
     printf 'PASS: the -i selector rejects an out-of-range index\n'
 }
 
+idle_gate_receipts() {
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune idle gate --sweeps 4 >/dev/null 2>&1 || fail "idle gate rejected a clean card"
+}
+
+test_idle_enable_without_receipts_is_sm_only() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    output=$(run_tune idle enable 2>&1) || fail "idle enable failed: $output"
+    assert_contains "$output" "SM-only - no idle-gate receipts"
+    conf="$TMP/state/idle/TESTSERIAL.conf"
+    assert_file_contains "$conf" "HBM=0"
+    assert_file_contains "$conf" "BUSY_NDIV=64"
+    assert_file_contains "$conf" "BUSY_CLK=0"
+    assert_file_not_contains "$conf" "IDLE_NDIV="
+    assert_file_contains "$TMP/idle.service" "ExecStart=$TMP/bin/idle_power"
+    assert_file_contains "$TMP/idle.service" "idle restore"
+    assert_file_contains "$TMP/calls.log" "systemctl enable 170tune-idle.service"
+    printf 'PASS: idle enable without receipts manages the card SM-only\n'
+}
+
+test_idle_gate_qualifies_both_clocks_and_hands_the_card_back() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    output=$(run_tune idle gate --sweeps 4 2>&1) || fail "idle gate failed: $output"
+    assert_contains "$output" "HBM PROFILE QUALIFIED: NDIV 64 timings 'REFRESH 24'"
+    assert_contains "$output" "HBM PROFILE QUALIFIED: NDIV 30 timings 'REFRESH 24'"
+    assert_contains "$output" "IDLE GATED"
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    assert_file_contains "$TMP/calls.log" "nvidia-smi -i 0 -rgc"
+    printf 'PASS: idle gate qualifies both clocks and hands the card back\n'
+}
+
+test_idle_gate_failure_keeps_the_card_on_its_busy_profile() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    control_set selftest_errors 3
+    if run_tune idle gate --sweeps 4 >/dev/null 2>&1; then
+        fail "idle gate passed a card that corrupts"
+    fi
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    printf 'PASS: a failed idle gate leaves the card on its busy profile\n'
+}
+
+test_idle_enable_with_receipts_manages_hbm_below_the_gated_peak() {
+    reset_controls
+    idle_gate_receipts
+    output=$(run_tune idle enable --group --idle-after 8 2>&1) || fail "idle enable failed: $output"
+    assert_contains "$output" "HBM + SM"
+    conf="$TMP/state/idle/TESTSERIAL.conf"
+    assert_file_contains "$conf" "HBM=1"
+    assert_file_contains "$conf" "IDLE_NDIV=30"
+    assert_file_contains "$conf" "COOL_REFRESH=24"
+    assert_file_contains "$conf" "HOT_C=65"
+    assert_file_contains "$conf" "COOL_C=62"
+    assert_file_contains "$conf" "DRIVER=610.43.03"
+    assert_file_contains "$TMP/state/idle/daemon.conf" "GROUP=1"
+    assert_file_contains "$TMP/state/idle/daemon.conf" "IDLE_AFTER=8"
+    printf 'PASS: idle enable with receipts manages HBM below the gated peak\n'
+}
+
+test_idle_receipts_do_not_survive_a_driver_change() {
+    reset_controls
+    idle_gate_receipts
+    control_set driver 615.71.09
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    assert_file_contains "$TMP/state/idle/TESTSERIAL.conf" "HBM=0"
+    printf 'PASS: idle receipts do not survive a driver change\n'
+}
+
+test_idle_follows_the_persisted_profile() {
+    reset_controls
+    rm -rf "$TMP/state/gated-hbm"
+    run_tune hbm-gate --ndiv 70 --timings "REFRESH 24" --sweeps 4 >/dev/null 2>&1 || fail "hbm-gate failed"
+    run_tune persist save --ndiv 70 --timings "REFRESH 24" --offset 250 --clk 1400 --force >/dev/null 2>&1 ||
+        fail "persist save failed"
+    control_set systemctl_enabled enabled
+    control_set ndiv 70
+    output=$(run_tune idle gate --sweeps 4 2>&1) || fail "idle gate failed: $output"
+    assert_contains "$output" "busy clock (NDIV 70)"
+    assert_eq "$(cat "$TMP/control/ndiv")" 70
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 24
+    assert_file_contains "$TMP/calls.log" "nvidia-smi -i 0 -lgc 210,1400"
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    conf="$TMP/state/idle/TESTSERIAL.conf"
+    assert_file_contains "$conf" "HBM=1"
+    assert_file_contains "$conf" "BUSY_NDIV=70"
+    assert_file_contains "$conf" "BUSY_REFRESH=24"
+    assert_file_contains "$conf" "BUSY_CLK=1400"
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    printf 'PASS: idle follows the persisted profile\n'
+}
+
+test_idle_refuses_hbm_beside_non_refresh_timings() {
+    reset_controls
+    cat > "$TMP/state/persist/TESTSERIAL.conf" <<'EOF'
+OC_SERIAL=TESTSERIAL
+NDIV=64
+OFFSET=
+CLK=
+TIMINGS="RAS 43 REFRESH 24"
+HBM_FORCED=1
+EOF
+    control_set systemctl_enabled enabled
+    if run_tune idle gate --sweeps 4 >/dev/null 2>&1; then
+        fail "idle gate accepted a profile with non-REFRESH timings"
+    fi
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    assert_file_contains "$TMP/state/idle/TESTSERIAL.conf" "HBM=0"
+    rm -f "$TMP/state/persist/TESTSERIAL.conf"
+    printf 'PASS: idle refuses HBM beside non-REFRESH timings\n'
+}
+
+test_mutating_commands_take_the_card_back_from_the_daemon() {
+    reset_controls
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    : > "$TMP/calls.log"
+    run_tune recover >/dev/null 2>&1 || true
+    assert_file_contains "$TMP/calls.log" "systemctl is-active --quiet 170tune-idle.service"
+    assert_file_contains "$TMP/calls.log" "nvml_oc saw pause-TESTSERIAL"
+    [ ! -e "$TMP/run/pause-TESTSERIAL" ] || fail "the hold outlived the command"
+    : > "$TMP/calls.log"
+    run_tune idle status >/dev/null 2>&1
+    assert_file_not_contains "$TMP/calls.log" "is-active --quiet"
+    printf 'PASS: mutating commands take the card back from the daemon\n'
+}
+
+test_idle_restore_puts_cards_back_on_their_busy_profile() {
+    reset_controls
+    idle_gate_receipts
+    run_tune idle enable >/dev/null 2>&1 || fail "idle enable failed"
+    control_set ndiv 30
+    control_set timing_REFRESH 24
+    run_tune idle restore >/dev/null 2>&1 || fail "idle restore failed"
+    assert_eq "$(cat "$TMP/control/ndiv")" 64
+    assert_eq "$(cat "$TMP/control/timing_REFRESH")" 6
+    assert_file_contains "$TMP/calls.log" "nvidia-smi -i 0 -rgc"
+    printf 'PASS: idle restore puts cards back on their busy profile\n'
+}
+
 test_path_overrides_isolate_state
 test_hbm_profile_identity_is_canonical
 test_hbm_profile_rejects_malformed_timings
@@ -1075,3 +1228,12 @@ test_boot_apply_keeps_old_sm_only_profile_compatible
 test_multi_gpu_boot_apply_targets_only_the_saved_card
 test_multi_gpu_boot_apply_rejects_serial_mismatch
 test_multi_gpu_selector_rejects_out_of_range_index
+test_idle_enable_without_receipts_is_sm_only
+test_idle_gate_qualifies_both_clocks_and_hands_the_card_back
+test_idle_gate_failure_keeps_the_card_on_its_busy_profile
+test_idle_enable_with_receipts_manages_hbm_below_the_gated_peak
+test_idle_receipts_do_not_survive_a_driver_change
+test_idle_follows_the_persisted_profile
+test_idle_refuses_hbm_beside_non_refresh_timings
+test_mutating_commands_take_the_card_back_from_the_daemon
+test_idle_restore_puts_cards_back_on_their_busy_profile
