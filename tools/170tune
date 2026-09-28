@@ -2717,7 +2717,7 @@ case "${1:-}" in
     qualify)    shift; need_root qualify "$@"; cmd_qualify "$@" ;;
     # Scope the hand-off to the SELECTED card: 170hx-oc applies a profile only to the card whose
     # serial matches OC_SERIAL, so on a multi-card box 'apply'/'reset' touch just this one (default 0).
-    apply)      shift; need_root apply "$@"; OC_SERIAL="$(serial)"; export OC_SERIAL; exec "$OCAPPLY" "${1:?profile}" ;;
+    apply)      shift; need_root apply "$@"; : "${1:?profile}"; OC_SERIAL="$(serial)"; export OC_SERIAL; exec "$OCAPPLY" "$@" ;;
     reset)      shift; need_root reset "$@"; OC_SERIAL="$(serial)"; export OC_SERIAL; exec "$OCAPPLY" stock ;;
     quarantine)   shift; cmd_quarantine "$@" ;;
     unquarantine) shift; cmd_unquarantine "$@" ;;
