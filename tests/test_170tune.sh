@@ -1064,6 +1064,7 @@ test_idle_enable_without_receipts_is_sm_only() {
     assert_file_contains "$conf" "BUSY_NDIV=64"
     assert_file_contains "$conf" "BUSY_CLK=0"
     assert_file_not_contains "$conf" "IDLE_NDIV="
+    assert_file_contains "$TMP/state/idle/daemon.conf" "IDLE_AFTER=60"
     assert_file_contains "$TMP/idle.service" "ExecStart=$TMP/bin/idle_power"
     assert_file_contains "$TMP/idle.service" "idle restore"
     assert_file_contains "$TMP/calls.log" "systemctl enable 170tune-idle.service"

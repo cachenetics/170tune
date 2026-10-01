@@ -5,6 +5,15 @@ reference and teaching documents state current truth only; the path that led the
 including the conclusions that turned out to be wrong, is recorded here so no dead end
 gets walked twice.
 
+## 2026-10-01: idle after 60 s by default, not 5
+
+- `idle enable` and the daemon's fallback now wait 60 quiet seconds before a card goes idle
+  (`--idle-after S` still overrides it). Idle power is worth having for the long stretches, like nights
+  and between sessions. With 5 s, the 5-30 s gaps an agent or chat client leaves between requests each paid
+  the wake-up and an HBM clock + refresh change: a tenant job with a 25 s duty cycle drove ~140
+  transitions an hour on one card. A minute keeps interactive use at full clocks for a few
+  watt-minutes per session.
+
 ## 2026-09-28: an emulated idle state - ~41 W to ~29 W per resident card
 
 - New `idle` command family and `tools/idle_power.c` daemon (docs/idle-power.md). The card

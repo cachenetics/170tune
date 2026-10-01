@@ -56,7 +56,7 @@ struct card {
 static struct card cards[MAX_CARDS];
 static int ncards;
 static int group = 0;
-static double idle_after = 5.0, busy_delta_w = 12.0;
+static double idle_after = 60.0, busy_delta_w = 12.0;
 static const char *idle_dir, *run_dir, *hbm_mclk, *fbpa_regs;
 static volatile sig_atomic_t stop;
 

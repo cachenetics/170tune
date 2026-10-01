@@ -2160,7 +2160,7 @@ UNIT
 }
 
 cmd_idle_enable() {
-    local group=0 idle_after=5 idx s receipt_busy receipt_idle p1 p2 p3 peak deep managed=0
+    local group=0 idle_after=60 idx s receipt_busy receipt_idle p1 p2 p3 peak deep managed=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --group) group=1; shift ;;
@@ -2901,7 +2901,7 @@ IDLE POWER (opt-in; the card has one P-state, so this emulates an idle one - see
                               optional gate (REFRESH 48 at NDIV 30) earns the deeper idle refresh.
   idle enable [--group] [--idle-after S]
                               write a conf for EVERY 170HX and start 170tune-idle.service. Quiet for
-                              S seconds (5): HBM to NDIV 30, SM locked to 210. Any work: back to the
+                              S seconds (60): HBM to NDIV 30, SM locked to 210. Any work: back to the
                               card's busy profile (its persisted point, else stock) at once. Refresh
                               is loosened only while the HBM is below its gated peak. Cards without
                               both receipts idle their SM only. Cards move independently, which

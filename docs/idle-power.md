@@ -40,7 +40,7 @@ to first token went from 48-50 ms to 88-133 ms; decode speed is unchanged.
 | | HBM clock | refresh | SM |
 |---|---|---|---|
 | busy | the card's busy NDIV | busy refresh, or 24 while cool | 210..busy ceiling |
-| idle (quiet for 5 s) | NDIV 30, while cool | busy refresh, or 24 (48 if gated) while cool | locked to 210 |
+| idle (quiet for 60 s) | NDIV 30, while cool | busy refresh, or 24 (48 if gated) while cool | locked to 210 |
 
 The busy profile is exactly what `boot-apply` leaves the card on: the persisted NDIV, REFRESH and
 clock ceiling when `170tune-persist` is enabled, else stock with no clock lock. Stopping the
@@ -48,9 +48,14 @@ daemon puts every card back on it.
 
 A card is busy the moment NVML reports any SM or memory utilization, or - while idle - its draw
 rises 12 W above the draw it settled at when it went idle (utilization is averaged over up to a
-second; the power sensor reacts in about 20 ms). It goes idle after 5 quiet seconds. Each card
+second; the power sensor reacts in about 20 ms). It goes idle after 60 quiet seconds
+(`--idle-after S`). The saving that matters is the long idle stretch - overnight, between
+sessions - not the few seconds between two requests: an agent or chat client leaves gaps of 5-30 s
+between tool calls, and a short timer makes each one pay the wake-up and puts the card through an
+HBM clock and refresh change every time (one tenant's 25 s duty cycle meant ~140 transitions an
+hour). A minute keeps interactive use at full clocks and costs a few watt-minutes per session. Each card
 moves on its own, which is also right for a model split pipeline- or tensor-parallel across cards:
-while it serves, every card shows utilization every second and none reaches 5 quiet seconds, and
+while it serves, every card shows utilization every second and none reaches 60 quiet seconds, and
 at the start of a burst the second card's own wake-up is lost in the first one's (first token from
 idle 88-124 ms independent vs 88-133 ms grouped, two-card pipeline-parallel). `--group` (wake and
 idle together) exists for setups where that does not hold; its cost is that one busy card keeps
